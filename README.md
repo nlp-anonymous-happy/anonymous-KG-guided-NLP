@@ -6,6 +6,11 @@ check requirements.txt
 
 The experiments in the paper are worked on 4 V100 GPUs.
 
+For convenience, you can download all necessary file from following google drive links:
+1. checkpoint model: [link](https://drive.google.com/file/d/17UiDRgpCROtTJPRsBoOdpz6h19ShXayo/view?usp=sharing) unzip and move to ./checkpoint
+2. description text embedding table: [link](https://drive.google.com/file/d/17g30zBWmk-qX733lraZ0XQUtgu0RXJKA/view?usp=sharing) unzip and move to ./cache
+3. knowledge graph data: [link](https://drive.google.com/file/d/1J4fdA__4TOS6XQ6iN1ehDywB-qoVCoou/view?usp=sharing) unzip and replace ./data/kgs
+
 ### Datasets
 
 #### 1. ReCoRD
