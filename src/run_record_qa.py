@@ -367,48 +367,48 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                     for k, v in tr_loss_dic.items():
                         logging_loss_dic[k] = v
 
-                if args.memory_bank_update and args.use_context_graph and args.speed_up_version == "v2" and global_step % args.memory_bank_update_steps == 0:
-                    model.eval()
-                    with torch.no_grad():
-                        start_time = timeit.default_timer()
-                        logger.info("cuda: {} updating entity description text embedding by the latest encoder".format(args.local_rank))
-                        t_list = torch.load(os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_info")["t_list"]
+#                 if args.memory_bank_update and args.use_context_graph and args.speed_up_version == "v2" and global_step % args.memory_bank_update_steps == 0:
+#                     model.eval()
+#                     with torch.no_grad():
+#                         start_time = timeit.default_timer()
+#                         logger.info("cuda: {} updating entity description text embedding by the latest encoder".format(args.local_rank))
+#                         t_list = torch.load(os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_info")["t_list"]
 
-                        encoder = model.module.text_embed_model
-                        t_list_input_ids = t_list["input_ids"].to(encoder.device)
-                        if args.text_embed_model == "bert":
-                            t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
-                        t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
+#                         encoder = model.module.text_embed_model
+#                         t_list_input_ids = t_list["input_ids"].to(encoder.device)
+#                         if args.text_embed_model == "bert":
+#                             t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
+#                         t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
 
-                        defid2defembed = torch.Tensor().to(encoder.device)
-                        c_size = 1024
-                        start_point = 0
-                        end_point = start_point + c_size
-                        total_size = len(t_list_input_ids)
-                        while True:
-                            if start_point > total_size:
-                                break
-                            if end_point > total_size:
-                                end_point = total_size
+#                         defid2defembed = torch.Tensor().to(encoder.device)
+#                         c_size = 1024
+#                         start_point = 0
+#                         end_point = start_point + c_size
+#                         total_size = len(t_list_input_ids)
+#                         while True:
+#                             if start_point > total_size:
+#                                 break
+#                             if end_point > total_size:
+#                                 end_point = total_size
 
-                            if args.text_embed_model == "bert":
-                                tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                              token_type_ids=t_list_token_type_ids[start_point:end_point, :],
-                                              attention_mask=t_list_attention_mask[start_point:end_point, :])[1]
-                            elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
-                                tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                              attention_mask=t_list_attention_mask[start_point:end_point, :])[1]
-                            else:
-                                logger.warning("not available LM, exit program")
-                                exit()
-                            defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
+#                             if args.text_embed_model == "bert":
+#                                 tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+#                                               token_type_ids=t_list_token_type_ids[start_point:end_point, :],
+#                                               attention_mask=t_list_attention_mask[start_point:end_point, :])[1]
+#                             elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
+#                                 tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+#                                               attention_mask=t_list_attention_mask[start_point:end_point, :])[1]
+#                             else:
+#                                 logger.warning("not available LM, exit program")
+#                                 exit()
+#                             defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
 
-                            start_point += c_size
-                            end_point += c_size
+#                             start_point += c_size
+#                             end_point += c_size
 
-                        model.module.update_defid2defembed(defid2defembed, args.memory_bank_keep_coef)
-                        logger.info("cuda: {} time for updating is {}".format(args.local_rank, timeit.default_timer() - start_time))
-                        logger.info("cuda: {} update is done".format(args.local_rank))
+#                         model.module.update_defid2defembed(defid2defembed, args.memory_bank_keep_coef)
+#                         logger.info("cuda: {} time for updating is {}".format(args.local_rank, timeit.default_timer() - start_time))
+#                         logger.info("cuda: {} update is done".format(args.local_rank))
 
                 # if args.memory_bank_update and global_step % args.memory_bank_update_steps == 0 and args.speed_up_version == "v2":
                 #     with torch.no_grad():
