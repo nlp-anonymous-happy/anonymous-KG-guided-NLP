@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Finetuning the library models for question-answering on SQuAD (DistilBERT, Bert, XLM, XLNet)."""
-
 
 import argparse
 import glob
@@ -24,23 +22,11 @@ import random
 import timeit
 import sys
 import numpy as np
-from tqdm import tqdm, trange
-import math
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import all_gather
-from torch.utils.tensorboard import SummaryWriter
-import torch.nn as nn
-from transformers import (
-    MODEL_FOR_QUESTION_ANSWERING_MAPPING,
-    WEIGHTS_NAME,
-    AdamW,
-    get_linear_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-)
-
 
 from model.model_utils import configure_tokenizer_model, load_model_from_checkpoint
 from kgs_retrieve.kg_utils import initialize_kg_retriever
@@ -51,6 +37,7 @@ import pickle
 from nltk.corpus import wordnet as wn
 from kgs_retrieve.baseretriever import KGRetriever, read_concept_embedding, run_strip_accents
 from tqdm import tqdm
+import json
 
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -58,7 +45,6 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
 
 sys.path.append('..')
 sys.path.append('.')
-# os.environ['CUDA_VISIBLE_DEVICES']='5, 6'
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -104,13 +90,8 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
 
-    # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
     eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
-    # synset_graphs_batch = []
-    # for batch_index in eval_dataloader.batch_sampler:
-    #     synset_graphs_batch.append([i for i in batch_index])
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -129,56 +110,8 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
 
     if args.local_rank == -1:
-        all_results = []
-        start_time = timeit.default_timer()
-        epoch_iterator = tqdm(eval_dataloader, desc="Evaluating Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.eval()
-            batch = tuple(t.to(args.device) for t in batch)
-            batch_synset_graphs = batch[3]
-            # batch_synset_graphs = torch.tensor(synset_graphs_batch[step], device=args.device)
-
-            with torch.no_grad():
-                inputs = create_input(args, batch, global_step, batch_synset_graphs=batch_synset_graphs, wn_synset_graphs=wn_synset_graphs, evaluate=True)
-                feature_indices = batch[3]
-
-                outputs = model(**inputs)
-
-            for i, feature_index in enumerate(feature_indices):
-                eval_feature = features[feature_index.item()]
-                unique_id = int(eval_feature.unique_id)
-
-                output = [to_list(output[i]) for output in outputs]
-                start_logits, end_logits = output
-                result = RecordResult(unique_id, start_logits, end_logits)
-
-                all_results.append(result)
-
-        evalTime = timeit.default_timer() - start_time
-        logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
-
-        # Compute predictions
-        output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-        output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
-
-
-        predictions = RecordProcessor.compute_predictions_logits(
-            examples_tokenized,
-            features,
-            all_results,
-            args.n_best_size,
-            args.max_answer_length,
-            output_prediction_file,
-            output_nbest_file,
-            args.verbose_logging,
-            os.path.join(args.data_dir, args.predict_file),
-            tokenizer,
-            is_testing=args.test
-        )
-
-        # Compute the F1 and exact scores.
-        results = RecordProcessor.record_evaluate(examples_tokenized, predictions, args.data_dir)
-        return results
+        logger.warning("program exits and please use pytorch DDP framework")
+        exit()
     else:
         # all_results = []
         all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
@@ -190,30 +123,20 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
             batch_synset_graphs = batch[3]
-            # batch_synset_graphs = torch.tensor(synset_graphs_batch[step], device=args.device)
             with torch.no_grad():
                 inputs = create_input(args, batch, global_step, batch_synset_graphs=batch_synset_graphs, wn_synset_graphs=wn_synset_graphs, evaluate=True)
                 feature_indices = batch[3]
 
                 outputs = model(**inputs)
 
-            # if step == 0:
-            #     all_logits = torch.Tensor([o for o in outputs], device=args.device)
-            # else:
             all_start_logits = torch.cat((all_start_logits, outputs[0]), dim=0)
             all_end_logits = torch.cat((all_end_logits, outputs[1]), dim=0)
-            # all_logits = torch.cat((all_logits, torch.cat((outputs[0].unsqueeze(0), outputs[1].unsqueeze(0)), dim=0).unsqueeze(0)), dim=0)
 
             for i, feature_index in enumerate(feature_indices):
                 eval_feature = features[feature_index.item()]
                 unique_id = int(eval_feature.unique_id)
                 all_unique_ids.append(unique_id)
-                #
-                # output = [to_list(output[i]) for output in outputs]
-                # start_logits, end_logits = output
-                # result = RecordResult(unique_id, start_logits, end_logits)
-                #
-                # all_results.append(result)
+
         all_unique_ids = torch.tensor(all_unique_ids, dtype=torch.long, device=args.device)
 
         start_time = timeit.default_timer()
@@ -226,8 +149,6 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         all_gather(all_end_logits_list, all_end_logits)
         all_gather(all_unique_ids_list, all_unique_ids)
 
-        logger.info("time for gather communication:{} in rank {}".format(timeit.default_timer() - start_time, args.local_rank))
-
         if args.local_rank == 0:
             start_time = timeit.default_timer()
             all_results = []
@@ -239,7 +160,6 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
                 batch_start_logits = all_start_logits_list[batch_idx]
                 batch_end_logits = all_end_logits_list[batch_idx]
                 for i, unique_id in enumerate(batch_unique_ids):
-                    # output = [to_list(output[i]) for output in batch_logits]
                     start_logits, end_logits = to_list(batch_start_logits[i]), to_list(batch_end_logits[i])
                     result = RecordResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
 
@@ -250,8 +170,7 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
             # Compute predictions
             output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-            output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
-
+            output_result = os.path.join(args.output_dir, "results_{}.jsonl".format(prefix))
 
             predictions = RecordProcessor.compute_predictions_logits(
                 examples_tokenized,
@@ -260,7 +179,7 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
                 args.n_best_size,
                 args.max_answer_length,
                 output_prediction_file,
-                output_nbest_file,
+                output_result,
                 args.verbose_logging,
                 os.path.join(args.data_dir, args.predict_file),
                 tokenizer,
@@ -269,7 +188,7 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
             # Compute the F1 and exact scores.
             if not args.test:
-                results = RecordProcessor.record_evaluate(examples_tokenized, predictions, args.data_dir)
+                results = RecordProcessor.record_evaluate(examples_tokenized, predictions, relate_path=args.output_dir)
                 return results
         else:
             return None
@@ -289,12 +208,17 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
         torch.distributed.barrier()
 
     # Load data features from cache or dataset file
+    if args.test:
+        temp_mark = "test"
+    elif evaluate:
+        temp_mark = "dev"
+    else:
+        temp_mark = "train"
     cached_features_file = os.path.join(
         input_dir,
-        "cached_{}_{}_{}_{}".format(
-            "test",
+        "cached_{}_{}_{}".format(
+            temp_mark,
             args.model_type,
-            args.speed_up_version,
             str(args.cache_file_suffix),
         ),
     )
@@ -308,12 +232,8 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
             features_and_dataset["dataset"],
             features_and_dataset["examples"],
         )
-        if args.model_type in ["bert", "roberta", "roberta_base"]:
-            logger.info("not have to load graph data")
-            all_kgs_graphs, all_kgs_graphs_label_dict = None, {}
-        else:
-            all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
-            # defid2defembed = torch.load(os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_embedding")["defid2defembed"]
+
+        all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
     else:
         logger.error("dataset not exist and program exits")
         exit()
@@ -337,13 +257,17 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
     tokenizer, _ = configure_tokenizer_model(args, logger, retrievers, is_preprocess=True)
 
     logger.info("tokenizer: {}".format(tokenizer))
-
+    if args.test:
+        temp_mark = "test"
+    elif evaluate:
+        temp_mark = "dev"
+    else:
+        temp_mark = "train"
     cached_features_file = os.path.join(
         input_dir,
-        "cached_{}_{}_{}_{}".format(
-            "test",
+        "cached_{}_{}_{}".format(
+            temp_mark,
             args.model_type,
-            args.speed_up_version,
             str(args.cache_file_suffix),
         ),
     )
@@ -364,23 +288,17 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
         logger.info("Loading examples from cached files.")
         examples = torch.load(cached_features_file + "_example")
 
-    if not os.path.exists(cached_features_file + "_example_tokenized"):
-        examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
+    examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
 
-    if not os.path.exists(cached_features_file + '_features_no_pad'):
-        features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers, not evaluate, debug=args.debug)
+    features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers, not evaluate, debug=args.debug)
 
     features, dataset, all_kgs_graphs = processor.pad_and_index_features_all(
         features, retrievers, args, tokenizer, relation_list, encoder=None, definition_info=definition_info, is_training=not evaluate, debug=args.debug)
 
     if args.local_rank in [-1, 0]:
-        # wn_synset_graphs = all_kgs_synset_graphs["wordnet"]
-        if args.model_type in ["bert", "roberta", "roberta_base"]:
-            all_kgs_graphs_label_dict = None
-        else:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file+"_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
-            logger.info("complete data preprocessing")
+        all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+        save_graphs(cached_features_file+"_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+        logger.info("complete data preprocessing")
 
         logger.info("Saving features into cached file %s", cached_features_file)
 
@@ -470,18 +388,23 @@ def check_synset(synset, synset_name):
 def main():
     parser = argparse.ArgumentParser()
 
-    model_g = ArgumentGroup(parser, "model", "model configuration and pafths.")
-
-    model_g.add_arg("test", bool, False, "test")
+    model_g = ArgumentGroup(parser, "model", "model configuration and path.")
+    model_g.add_arg("is_update_max_concept", bool, True, "weather update max concept for kg retriver")
+    model_g.add_arg("full_table", bool, True, "full_table")
+    model_g.add_arg("test", bool, False, "weather load superglue test set")
     model_g.add_arg("use_wn", bool, True, "wn")
     model_g.add_arg("use_nell", bool, True, "nell")
+
+    model_g.add_arg("sentinel_trainable", bool, False, "sentinel_trainable")
+    model_g.add_arg("memory_bank_update", bool, False, "memory_bank_update")
+    model_g.add_arg("memory_bank_update_steps", int, 500, "memory_bank_update_steps")
+    model_g.add_arg("memory_bank_keep_coef", float, 0.0, "what percent keep")
     model_g.add_arg("use_context_graph", bool, True, "use_context_graph")
 
 
     model_g.add_arg("schedule_strategy", str, "linear", "schedule_strategy")
     model_g.add_arg("tokenizer_path", str, "", "tokenizer_path")
     model_g.add_arg("save_model", bool, True, "whether save model")
-    model_g.add_arg("speed_up_version", str, "v2", "choose speed up strategy")
     model_g.add_arg("data_preprocess", bool, False, "data process")
     model_g.add_arg("data_preprocess_evaluate", bool, False, "data_preprocess_evaluate")
 
@@ -501,11 +424,13 @@ def main():
                      "_synset_domain_region_of", "_member_of_domain_usage", "_synset_domain_usage_of", "_similar_to"], "The used relation.")
     model_g.add_arg("is_all_relation", bool, True, "use all relations")
     model_g.add_arg("selected_relation", str, "_hyponym,_hypernym,_derivationally_related_form", "relations")
-    model_g.add_arg("is_parallel_for_dgl_preprocess", bool, False, "is_parallel_for_dgl_preprocess")
-    model_g.add_arg("chunksize_for_graph", int, 40, "The chunksize for multiprocessing to convert examples to features.")
-    model_g.add_arg("wn18_dir", str, "",
-                    "wn18 dir")
+    model_g.add_arg("wn18_dir", str, "", "wn18 dir")
 
+    # SSL part
+    model_g.add_arg("use_consistent_loss_wn", bool, False, "add consistent loss between entity embedding from WN.")
+    model_g.add_arg("warm_up", int, 10000, "warm_up_iterations")
+    model_g.add_arg("consistent_loss_wn_coeff", float, 2.0, "Weight decay if we apply some.")
+    model_g.add_arg("consistent_loss_type", str, "kld", "consistent loss type")
     model_g.add_arg("mark", str, "test1", "mark")
     model_g.add_arg("tensorboard_dir", str, "./", "tensorboard_dir")
     model_g.add_arg("debug", bool, False, "debug")
@@ -543,7 +468,6 @@ def main():
     model_g.add_arg("verbose_logging", bool, False, "If true, all of the warnings related to data processing will be printed. "
         "A number of warnings are expected for a normal SQuAD evaluation.")
     model_g.add_arg("init_dir", str, "", "The path of loading pre-trained model.")
-    model_g.add_arg("mem_method", str, "raw", "The KG nodes embedding methods.")
     model_g.add_arg("initializer_range", float, 0.02, "The initializer range for KELM")
     model_g.add_arg("cat_mul", bool, True, "The output part of vector in KELM")
     model_g.add_arg("cat_sub", bool, True, "The output part of vector in KELM")
@@ -554,9 +478,7 @@ def main():
     data_g = ArgumentGroup(parser, "data", "Data paths, vocab paths and data processing options")
     data_g.add_arg("train_file", str, "record/train_0831.json", "ReCoRD json for training. E.g., train.json.")
     data_g.add_arg("predict_file", str, "record/dev_0831.json", "ReCoRD json for predictions. E.g. dev.json.")
-    # data_g.add_arg("train_file", str, "record/train.json", "ReCoRD json for training. E.g., train.json.")
-    # data_g.add_arg("predict_file", str, "record/dev.json", "ReCoRD json for predictions. E.g. dev.json.")
-    data_g.add_arg("cache_file_suffix", str, "IDE_tt", "The suffix of cached file.")
+    data_g.add_arg("cache_file_suffix", str, "test", "The suffix of cached file.")
     data_g.add_arg("cache_dir", str, "", "The cached data path.")
     data_g.add_arg("cache_store_dir", str, "", "The cached data path.")
     data_g.add_arg("data_dir", str, "", "The input data dir. Should contain the .json files for the task."
@@ -667,8 +589,6 @@ def main():
         args.use_fp16,
     )
 
-    # logging.getLogger("transformers.configuration_utils").setLevel(logging.WARNING)
-
     # Set seed
     set_seed(args)
 
@@ -686,14 +606,19 @@ def main():
 
     processor = RecordProcessor(args)
 
-    input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}_{}".format(
+    input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}".format(
             args.model_type,
-            args.speed_up_version,
             str(args.cache_file_suffix),
     )
                              )
+    if not os.path.exists(input_dir):
+        os.mkdir(input_dir)
 
-    args.wn_def_embed_mat_dir = os.path.join("./cache", "record_test_script_test_definition_embedding_mat")
+    if args.full_table:
+        logger.warning("set full_table False and program exits")
+        exit()
+    else:
+        args.wn_def_embed_mat_dir = os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_embedding"
 
     # if not os.path.exists(args.wn_def_embed_mat_dir):
     #     data_path = os.path.join(args.data_dir, args.kg_paths["wordnet"])
@@ -713,10 +638,9 @@ def main():
 
         retrievers[kg] = initialize_kg_retriever(kg, kg_path, data_path, args.cache_file_suffix)
 
-    if not os.path.exists(input_dir):
-        os.mkdir(input_dir)
+    if args.data_preprocess:
         logger.info("begin preprocess")
-        create_dataset(args, processor, retrievers, relation_list=args.relation_list, evaluate=True, input_dir=input_dir)
+        create_dataset(args, processor, retrievers, relation_list=args.relation_list, evaluate=args.data_preprocess_evaluate, input_dir=input_dir)
 
         logger.info("data preprocess is done")
 
@@ -729,10 +653,8 @@ def main():
         # Make sure only the first process in distributed training will download model & vocab
         torch.distributed.barrier()
 
-    # model.update_definition_embedding_mat(
-    #     torch.load(args.wn_def_embed_mat_dir)["definition_embedding_mat"])
     model.to(args.device)
-    results = evaluate(args, model, processor, tokenizer, 100, input_dir)
+    results = evaluate(args, model, processor, tokenizer, 100, input_dir, prefix=args.mark)
 
     if args.local_rank in [-1, 0]:
         logger.info("results: {}".format(results))

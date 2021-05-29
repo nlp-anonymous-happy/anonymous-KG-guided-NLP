@@ -1,10 +1,26 @@
+# -*- coding: utf-8 -*-
+# ==============================================================================
+# Copyright 2019 Baidu.com, Inc. All Rights Reserved
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import string
 import logging
 import nltk
 import os
 from nltk.corpus import wordnet as wn
 from kgs_retrieve.baseretriever import KGRetriever, read_concept_embedding, run_strip_accents
-import networkx as nx
 import pickle
 import numpy as np
 
@@ -20,7 +36,6 @@ class WordnetRetriever(KGRetriever):
         self.filepath = filepath
         self.name = "wordnet"
         self.max_concept_length = 0
-        self.max_definition_length = 0
 
         concept_embedding_path = os.path.join(filepath, "wn_concept2vec.txt")
         self.id2concept, self.concept2id, self.concept_embedding_mat = read_concept_embedding(
@@ -49,11 +64,9 @@ class WordnetRetriever(KGRetriever):
 
         repeated_id_path = os.path.join(self.filepath, "repeated_id.npy")
 
-        # self.repeated_id = {}
-        # if not os.path.exists(repeated_id_path):
-        #     self.repeated_id = {}
-        # else:
         self.repeated_id = np.load(repeated_id_path, allow_pickle='TRUE').item()
+
+        self.conceptids2synset = {}
 
     def create_entire_wn18_graph(self):
         wn18_full = open(self.wn18_path, 'a')
@@ -97,12 +110,8 @@ class WordnetRetriever(KGRetriever):
     def lookup_concept_ids_single(self, text, ori_to_tok_map, tok_num, tolower, no_stopwords, ignore_length, tokenizer, is_filter,
                                   is_lemma, is_clean, is_morphy, query=True, query_size=0):
         concept_ids = [[] for _ in range(tok_num)]
-        definition_list = [[] for _ in range(tok_num)]
         words = text.split(" ")
         word_to_ori_map = []
-        graphs = []
-        graph_synset = nx.DiGraph()
-        graphs.append(graph_synset)
         is_begin = True
         conceptids2synset = {}
 
@@ -135,7 +144,6 @@ class WordnetRetriever(KGRetriever):
                 logger.warning("{} can't work in nltk".format(retrieve_token))
                 synsets = []
             wn18synset_names = []
-            wn18synset_names2definition = {}
             if is_morphy:
                 # logger.info("morphy match")
                 morphy_set = self.get_morphy(retrieve_token)
@@ -156,24 +164,18 @@ class WordnetRetriever(KGRetriever):
 
                 offset_str = str(synset.offset()).zfill(8)
                 if offset_str in self.offset_to_wn18name_dict:
-                    synset_nnnnname = self.offset_to_wn18name_dict[offset_str]
-                    # wn18synset_names.append(synset_nnnnname)
+                    full_synset_name = self.offset_to_wn18name_dict[offset_str]
 
-                    if is_clean and self.is_repeated(self.concept2id[synset_nnnnname]):
+                    if is_clean and self.is_repeated(self.concept2id[full_synset_name]):
                         continue
-                    if self.concept2id[synset_nnnnname] in conceptids2synset and conceptids2synset[self.concept2id[synset_nnnnname]] != synset:
+                    if self.concept2id[full_synset_name] in conceptids2synset and conceptids2synset[self.concept2id[full_synset_name]] != synset:
                         logger.warning("different wn object {} {} map to the same id {}".format
-                                       (conceptids2synset[self.concept2id[synset_nnnnname]], synset, self.concept2id[synset_nnnnname]))
-                        if self.concept2id[synset_nnnnname] not in self.repeated_id:
-                            self.repeated_id[self.concept2id[synset_nnnnname]] = [str(conceptids2synset[self.concept2id[synset_nnnnname]]), str(synset)]
-                        # self.repeated_id.append(self.concept2id[synset_nnnnname])
+                                       (conceptids2synset[self.concept2id[full_synset_name]], synset, self.concept2id[full_synset_name]))
+                        if self.concept2id[full_synset_name] not in self.repeated_id:
+                            self.repeated_id[self.concept2id[full_synset_name]] = [str(conceptids2synset[self.concept2id[full_synset_name]]), str(synset)]
 
-                    wn18synset_names.append(synset_nnnnname)
-                    conceptids2synset[self.concept2id[synset_nnnnname]] = synset
-                    definition_sentence = synset.definition()
-                    if not definition_sentence:
-                        logging.info("{} definition not exist".format(synset))
-                    wn18synset_names2definition[self.offset_to_wn18name_dict[offset_str]] = definition_sentence
+                    wn18synset_names.append(full_synset_name)
+                    conceptids2synset[self.concept2id[full_synset_name]] = synset
 
             if len(wn18synset_names) > 0:
                 ori_index = word_to_ori_map[i]
@@ -184,26 +186,8 @@ class WordnetRetriever(KGRetriever):
                 for tok_id in toks_id:
                     for synset_name in wn18synset_names:
                         concept_ids[tok_id].extend([self.concept2id[synset_name]])
-                        if query:
-                            src_id = tok_id + len(self.concept2id) + 1
-                        else:
-                            src_id = tok_id + query_size + len(self.concept2id) + 1 + 1 + 1
-                        dst_id = self.concept2id[synset_name]
-                        graph_synset.add_node(dst_id, definition=wn18synset_names2definition[synset_name],
-                                              type="concept")
-                        graph_synset.add_node(src_id, type="token")
 
-                        graph_synset.add_edge(src_id, dst_id, direction=0)
-                        graph_synset.add_edge(dst_id, src_id, direction=1)
-
-                    # concept_ids[tok_id].extend([self.concept2id[synset_name] for synset_name in wn18synset_names])
-                    definition_list[tok_id].extend(
-                        [tokenizer(wn18synset_names2definition[synset_name])['input_ids'] for synset_name in
-                         wn18synset_names])
-
-        # check_definition_list(definition_list)
-
-        return concept_ids, definition_list, graphs, conceptids2synset
+        return concept_ids, conceptids2synset
 
     def lookup_concept_ids(self, example_tokenized, tokenizer, **kwargs):
         """
@@ -228,10 +212,10 @@ class WordnetRetriever(KGRetriever):
         doc_text = example_tokenized.doc_text
 
         query_ori_to_tok_map, doc_ori_to_tok_map = example_tokenized.query_ori_to_tok_map, example_tokenized.doc_ori_to_tok_map
-        query_concept_ids, query_definition_list, query_graphs, query_conceptids2synset = self.lookup_concept_ids_single(
+        query_concept_ids, query_conceptids2synset = self.lookup_concept_ids_single(
             query_text, query_ori_to_tok_map, len(example_tokenized.query_tokens), tolower, no_stopwords, ignore_length,
             tokenizer, is_filter=is_filter, is_lemma=is_lemma, is_clean=is_clean, is_morphy=is_morphy)
-        doc_concept_ids, doc_definition_list, doc_graphs, doc_conceptids2synset = \
+        doc_concept_ids, doc_conceptids2synset = \
             self.lookup_concept_ids_single(doc_text, doc_ori_to_tok_map, len(example_tokenized.doc_tokens), tolower,
                                            no_stopwords, ignore_length, tokenizer, is_filter=is_filter, is_lemma=is_lemma,
                                            is_clean=is_clean, is_morphy=is_morphy, query=False,
@@ -241,32 +225,7 @@ class WordnetRetriever(KGRetriever):
         doc_max_concept_length = max([len(concpets) for concpets in doc_concept_ids])
         max_concept_length = max(query_max_concept_length, doc_max_concept_length)
 
-        query_max_definition_length = 0
-        for definitions in query_definition_list:
-            for definition in definitions:
-                if len(definition) >= query_max_definition_length:
-                    query_max_definition_length = len(definition)
-
-        doc_max_definition_length = 0
-        for definitions in doc_definition_list:
-            for definition in definitions:
-                if len(definition) >= doc_max_definition_length:
-                    doc_max_definition_length = len(definition)
-
-        max_definition_length = max(query_max_definition_length, doc_max_definition_length)
-
-        return query_concept_ids, doc_concept_ids, max_concept_length, \
-               query_definition_list, doc_definition_list, max_definition_length, \
-               query_graphs, doc_graphs, query_conceptids2synset, doc_conceptids2synset
-
-
-    def check_definition_list(self, definition_list):
-        for i in range(len(definition_list)):
-            if not isinstance(definition_list[i], list):
-                print("wrong_type{}".format(i))
-            for j in range(len(definition_list[i])):
-                if not isinstance(definition_list[i][j], list):
-                    print("wrong_type{}   {}".format(i, j))
+        return query_concept_ids, doc_concept_ids, max_concept_length, query_conceptids2synset, doc_conceptids2synset
 
     def is_center_entity(self, entity, word, morphy_set, is_morphy):
         if len(str(entity).split("'")) == 3:

@@ -1,3 +1,19 @@
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 import os
 import copy
@@ -171,7 +187,6 @@ class RecordProcessor(DataProcessor):
         self.use_kgs = args.use_kgs
         self.max_query_length = args.max_query_length
         self.max_seq_length = args.max_seq_length
-        # self.tokenizer_type = args.model_type if args.model_type!="kelm" else args.base_model
         self.no_stopwords = args.no_stopwords
         self.ignore_length = args.ignore_length
         self.is_filter = args.is_filter
@@ -239,7 +254,6 @@ class RecordProcessor(DataProcessor):
         """
         features = []
         max_retrieved = dict()
-        max_retrieved_definition = dict()
         if isinstance(tokenizer, RobertaTokenizer):
             self.tokenizer_type = "roberta"
         elif isinstance(tokenizer, BertTokenizer):
@@ -258,11 +272,6 @@ class RecordProcessor(DataProcessor):
         # get the query and document tokens' corresponding concepts.
         query_kgs_concepts = dict()
         doc_kgs_concepts = dict()
-        query_kgs_definition = dict()
-        doc_kgs_definition = dict()
-        query_kgs_graphs = dict()
-        doc_kgs_graphs = dict()
-        kgs_graphs = dict()
         kgs_query_conceptids2synset = dict()
         kgs_doc_conceptids2synset = dict()
 
@@ -279,19 +288,12 @@ class RecordProcessor(DataProcessor):
                 args_dict['is_clean'] = self.is_clean
                 args_dict['is_morphy'] = self.is_morphy
 
-                query_kg_concept_ids, doc_kg_concept_ids, max_concept_length, query_definition_list, doc_definition_list, \
-                max_definition_length, query_graphs, doc_graphs, query_conceptids2synset, doc_conceptids2synset = \
+                query_kg_concept_ids, doc_kg_concept_ids, max_concept_length, query_conceptids2synset, doc_conceptids2synset = \
                     KGRetriever.lookup_concept_ids(example, tokenizer, **args_dict)
                 # to guarantee the length of tokens doesn't exceed the limitation.
                 if tok_len > self.max_query_length:
                     query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
-                    query_definition_list = query_definition_list[: self.max_query_length]
-                    # logger.warning("warning!  need to deal with graph data")
-                    # exit()
-                query_kgs_definition[kg_info] = query_definition_list
-                doc_kgs_definition[kg_info] = doc_definition_list
-                query_kgs_graphs[kg_info] = query_graphs
-                doc_kgs_graphs[kg_info] = doc_graphs
+
                 kgs_query_conceptids2synset[kg_info] = query_conceptids2synset
                 kgs_doc_conceptids2synset[kg_info] = doc_conceptids2synset
 
@@ -302,26 +304,20 @@ class RecordProcessor(DataProcessor):
                 # to guarantee the length of tokens doesn't exceed the limitation.
                 if tok_len > self.max_query_length:
                     query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
-                query_kgs_definition[kg_info] = []
-                doc_kgs_definition[kg_info] = []
-                max_definition_length = 0
-                query_kgs_graphs[kg_info] = []
-                doc_kgs_graphs[kg_info] = []
                 kgs_query_conceptids2synset[kg_info] = []
                 kgs_doc_conceptids2synset[kg_info] = []
 
             query_kgs_concepts[kg_info] = query_kg_concept_ids
             doc_kgs_concepts[kg_info] = doc_kg_concept_ids
             max_retrieved[kg_info] = max_concept_length
-            max_retrieved_definition[kg_info] = max_definition_length
 
         # build the former part of tokens. Namely, add functional tokens in the query tokens..
-        former_tokens, former_segment_ids, former_kgs_concept_ids, former_kgs_definition_ids = build_first_part_features(
+        former_tokens, former_segment_ids, former_kgs_concept_ids = build_first_part_features(
             self.tokenizer_type,
             self.use_kgs,
             query_tokens,
             query_kgs_concepts,
-            query_kgs_definition)
+            )
 
 
         # cut the long doc tokens into shorter spans. Distinguish the training mode and valiation mode.
@@ -353,7 +349,6 @@ class RecordProcessor(DataProcessor):
             tokens = copy.deepcopy(former_tokens)
             segment_ids = copy.deepcopy(former_segment_ids)
             kgs_concept_ids = copy.deepcopy(former_kgs_concept_ids)
-            kgs_definition_ids = copy.deepcopy(former_kgs_definition_ids)
             tok_offset = len(tokens)
 
             # if (doc_span.start + doc_span.length) < len(doc_tokens):
@@ -363,9 +358,6 @@ class RecordProcessor(DataProcessor):
             segment_ids.extend([1] * doc_span.length)
             for kg in self.use_kgs:
                 kgs_concept_ids[kg].extend(doc_kgs_concepts[kg][doc_span.start: (doc_span.start + doc_span.length)])
-                if kg == "wordnet":
-                    kgs_definition_ids[kg].extend(
-                        doc_kgs_definition[kg][doc_span.start: (doc_span.start + doc_span.length)])
 
             if self.tokenizer_type == "roberta":
                 tokens.append("</s>")
@@ -374,7 +366,6 @@ class RecordProcessor(DataProcessor):
             segment_ids.append(1)
             for kg in self.use_kgs:
                 kgs_concept_ids[kg].append([])
-                kgs_definition_ids[kg].append([])
 
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.
@@ -383,14 +374,6 @@ class RecordProcessor(DataProcessor):
             if start_position is not None:
                 start_position = start_position - doc_span.start + tok_offset
                 end_position = end_position - doc_span.start + tok_offset
-
-            # d = query_kgs_definition["wordnet"]
-            # check_definition_list(d)
-            for kg in self.use_kgs:
-                kgs_graphs[kg] = []
-                if kg == "wordnet":
-                    for i, graph in enumerate(query_kgs_graphs[kg]):
-                        kgs_graphs[kg].append(nx.compose(query_kgs_graphs[kg][i], doc_kgs_graphs[kg][i]))
 
             kgs_conceptids2synset = {}
             for kg in self.use_kgs:
@@ -445,13 +428,11 @@ class RecordProcessor(DataProcessor):
                 start_position=start_position,
                 end_position=end_position,
                 kgs_concept_ids=kgs_concept_ids,
-                # kgs_definition_ids=kgs_definition_ids,
-                # kgs_graphs=kgs_graphs,
                 kgs_conceptids2synset=kgs_conceptids2synset,
             )
 
             features.append(feature)
-        return features, max_retrieved, max_retrieved_definition
+        return features, max_retrieved
 
     def convert_examples_to_features(self,
                                      args,
@@ -497,16 +478,8 @@ class RecordProcessor(DataProcessor):
         for kg in self.use_kgs:
             val = retrievers[kg]
             kg_max = max([item[1][kg] for item in results if len(item[0]) > 0])
-            if kg == 'wordnet':
-                definition_max = max([item[2][kg] for item in results if len(item[0]) > 0])
-            # if is_training:
-            #     val.update_max_concept_length(kg_max)
-            #     if kg == 'wordnet':
-            #         val.update_max_definition_length(definition_max)
-
-            val.update_max_concept_length(kg_max)
-            if kg == 'wordnet':
-                val.update_max_definition_length(definition_max)
+            if is_training or args.is_update_max_concept:
+                val.update_max_concept_length(kg_max)
 
         return features
 
@@ -515,11 +488,8 @@ class RecordProcessor(DataProcessor):
         new_features = []
         for feature in features:
 
-            w = feature.kgs_concept_ids["wordnet"]
-            check_concept_list(w)
-
-            # d = feature.kgs_definition_ids["wordnet"]
-            # check_definition_list(d)
+            # w = feature.kgs_concept_ids["wordnet"]
+            # check_concept_list(w)
 
             pad_len = self.max_seq_length - len(feature.input_ids)
             feature.input_ids.extend([0] * pad_len)
@@ -531,61 +501,24 @@ class RecordProcessor(DataProcessor):
                     logger.warning(
                         "Feature qas-id: {} has {} different concepts length {} with max seq length {}".format(
                             feature.qas_id, kg, len(feature.kgs_concept_ids[kg]), self.max_seq_length))
-                # if kg == "wordnet":
-                #     feature.kgs_definition_ids[kg].extend([[] for _ in range(pad_len)])
-                #     if len(feature.kgs_definition_ids[kg]) != self.max_seq_length:
-                #         logger.warning("Feature qas-id: {} has {} different definition length {} with max seq length {}".format(feature.qas_id, kg, len(feature.kgs_definition_ids[kg]), self.max_seq_length))
 
             assert len(feature.input_ids) == self.max_seq_length
             assert len(feature.attention_mask) == self.max_seq_length
             assert len(feature.token_type_ids) == self.max_seq_length
 
-            w = feature.kgs_concept_ids["wordnet"]
-            check_concept_list(w)
-
-            # d = feature.kgs_definition_ids["wordnet"]
-            # check_definition_list(d)
-
+            # w = feature.kgs_concept_ids["wordnet"]
+            # check_concept_list(w)
             # pad kg concepts
             for kg in self.use_kgs:
                 concept_ids = feature.kgs_concept_ids[kg]
-                # definition_ids = feature.kgs_definition_ids[kg]
                 kg_max_len = retrievers[kg].get_concept_max_length()
                 for cindex in range(self.max_seq_length):
                     expaned_concept_ids = concept_ids[cindex] + [0 for _ in range(
                         kg_max_len - len(concept_ids[cindex]))]
                     concept_ids[cindex] = expaned_concept_ids[:kg_max_len]
-                    # if kg == "wordnet":
-                    #     expaned_definition_ids = copy.deepcopy(definition_ids[cindex])
-                    #     for _ in range(kg_max_len - len(definition_ids[cindex])):
-                    #         expaned_definition_ids.append([0])
-                    #     definition_ids[cindex] = expaned_definition_ids
-                # if kg == "wordnet":
-                #     assert all([len(id_list) == kg_max_len for id_list in definition_ids])
                 assert all([len(id_list) == kg_max_len for id_list in concept_ids])
 
-                # w = concept_ids
-                # check_concept_list(w)
-
                 feature.kgs_concept_ids[kg] = concept_ids
-                # feature.kgs_definition_ids[kg] = definition_ids
-
-            # d = feature.kgs_definition_ids["wordnet"]
-            # check_definition_list(d)
-
-            # for kg in self.use_kgs:
-            #     if kg == "wordnet":
-            #         definition_ids = feature.kgs_definition_ids[kg]
-            #         definition_max_len = retrievers[kg].get_definition_max_length()
-            #         for i in range(self.max_seq_length):
-            #             for j in range(retrievers[kg].get_concept_max_length()):
-            #                 expaned_definition_ids = definition_ids[i][j] + \
-            #                                          [0 for _ in range(definition_max_len - len(definition_ids[i][j]))]
-            #                 definition_ids[i][j] = expaned_definition_ids[:definition_max_len]
-            #         feature.kgs_definition_ids[kg] = definition_ids
-
-            # w = feature.kgs_concept_ids["wordnet"]
-            # check_concept_list(w)
 
             new_features.append(feature)
         return new_features
@@ -598,47 +531,24 @@ class RecordProcessor(DataProcessor):
         for kg in self.use_kgs:
             ret = retrievers[kg]
             logger.info("KG {}'s max retrieved concpet length {}".format(kg, ret.get_concept_max_length()))
-            logger.info("KG {}'s max retrieved definition length {}".format(kg, ret.get_definition_max_length()))
-
-        # for feature in features:
-        #     w = feature[0].kgs_concept_ids["wordnet"]
-        #     for i in range(len(w)):
-        #         if not isinstance(w[i], list):
-        #             print("wrong_type{}".format(i))
-        #             print(w[i])
-        #         for j in range(len(w[i])):
-        #             if not isinstance(w[i][j], int):
-        #                 print("wrong_type{}   {}".format(i, j))
-        #                 print(w[i][j])
-        # cc = set()
-        # for idx, feature in enumerate(features):
-        #     d = feature[0].kgs_definition_ids["wordnet"]
-        #     for i in range(len(d)):
-        #         if not isinstance(d[i], list):
-        #             print("wrong_type{}".format(i))
-        #         for j in range(len(d[i])):
-        #             if not isinstance(d[i][j], list) or d[i][j][0] != 101:
-        #                 print("wrong_type {}   {}   {}".format(idx, i, j))
-        #                 cc.add(idx)
-        # print(cc)
 
         if debug:
             for feature in features:
                 self.pad_and_index_features(feature, retrievers)
-
-        with Pool(threads) as p:
-            annotate_ = partial(
-                self.pad_and_index_features,
-                retrievers=retrievers,
-            )
-            padded_features = list(
-                tqdm(
-                    p.imap(annotate_, features, chunksize=args.chunksize),
-                    total=len(features),
-                    desc="pad features",
-                    disable=not tqdm_enabled,
+        else:
+            with Pool(threads) as p:
+                annotate_ = partial(
+                    self.pad_and_index_features,
+                    retrievers=retrievers,
                 )
-            )
+                padded_features = list(
+                    tqdm(
+                        p.imap(annotate_, features, chunksize=args.chunksize),
+                        total=len(features),
+                        desc="pad features",
+                        disable=not tqdm_enabled,
+                    )
+                )
 
         new_features = []
         unique_id = 1000000000
@@ -921,7 +831,7 @@ class RecordProcessor(DataProcessor):
                 return True
             return False
 
-        def remove_special_punc(c, answer=False):
+        def remove_special_punc(c):
             if c == "‘":
                 return "\'"
             if c == "’":
@@ -931,29 +841,6 @@ class RecordProcessor(DataProcessor):
             if c == "”":
                 return "\""
             return c
-
-        # def remove_special_punc(c, answer=False):
-        #     # if c == "‘":
-        #     #     if answer:
-        #     #         logger.warning("deal with answer")
-        #     #     else:
-        #     #         return "\'"
-        #     # if c == "’":
-        #     #     if answer:
-        #     #         logger.warning("deal with answer")
-        #     #     else:
-        #     #         return "\'"
-        #     # if c == "“":
-        #     #     if answer:
-        #     #         logger.warning("deal with answer")
-        #     #     else:
-        #     #         return "\""
-        #     # if c == "”":
-        #     #     if answer:
-        #     #         logger.warning("deal with answer")
-        #     #     else:
-        #     #         return "\""
-        #     return c
 
         examples = []
         for entry in tqdm(input_data, desc='Reading entries from json'):
@@ -1003,7 +890,7 @@ class RecordProcessor(DataProcessor):
 
                     entity_text = ""
                     for c in entity['text']:
-                        entity_text += remove_special_punc(c, answer=False)
+                        entity_text += remove_special_punc(c)
 
                     entity_doc_text = doc_text[entity_start_offset: entity_end_offset + 1]
                     if entity_doc_text != entity_text:
@@ -1034,11 +921,12 @@ class RecordProcessor(DataProcessor):
             n_best_size,
             max_answer_length,
             output_prediction_file,
-            output_nbest_file,
+            output_result,
             verbose_logging,
             predict_file,
             tokenizer,
-            is_testing
+            is_testing,
+            att_score=None,
     ):
         """read in the dev.json file"""
         logger.info(" Find {}-best prediction for each qas-id.".format(n_best_size))
@@ -1129,21 +1017,17 @@ class RecordProcessor(DataProcessor):
             logger.info(f"Writing predictions to: {output_prediction_file}")
             with open(output_prediction_file, "w") as writer:
                 writer.write(json.dumps(all_predictions, indent=4) + "\n")
-
-        if output_nbest_file:
-            logger.info(f"Writing nbest to: {output_nbest_file}")
-            with open(output_nbest_file, "w") as writer:
-                writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
-
-            output_lines = [to_jsonl(elem_id, elem) for elem_id, elem in all_predictions.items()]
-            output_data_lines = "\n".join(output_lines)
-            with open(output_nbest_file+"_submission", "w") as writer:
-                writer.write(output_data_lines)
+        logger.info(f"Writing results to: {output_result}")
+        output_lines = [to_jsonl(elem_id, elem) for elem_id, elem in all_predictions.items()]
+        output_data_lines = "\n".join(output_lines)
+        with open(output_result, "w") as writer:
+            writer.write(output_data_lines)
+            writer.write("\n")
 
         return all_predictions
 
     @classmethod
-    def record_evaluate(cls, examples, predictions, relate_path="../data/"):
+    def record_evaluate(cls, examples, predictions, relate_path):
         evaluates = dict()
 
         f1 = exact_match = total = 0
@@ -1330,14 +1214,12 @@ def get_doc_spans(all_doc_tokens_len, max_tokens_for_doc, doc_stride):
     return doc_spans
 
 
-def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_concepts, query_kgs_definition):
+def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_concepts):
     tokens = []
     segment_ids = []
     kgs_concept_ids = dict()
-    kgs_definition_ids = dict()
     for kg in use_kg:
         kgs_concept_ids[kg] = []
-        kgs_definition_ids[kg] = []
 
     # load the query part.
     if tokenizer_type == "roberta":
@@ -1347,11 +1229,8 @@ def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_co
     segment_ids.append(0)
     for kg in use_kg:
         kgs_concept_ids[kg].append([])
-        kgs_definition_ids[kg].append([])
         for query_concept in query_kgs_concepts[kg]:
             kgs_concept_ids[kg].append(query_concept)
-        for query_definition in query_kgs_definition[kg]:
-            kgs_definition_ids[kg].append(query_definition)
 
     for token in query_tokens:
         tokens.append(token)
@@ -1362,15 +1241,13 @@ def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_co
         segment_ids.extend([0, 1])
         for kg in use_kg:
             kgs_concept_ids[kg].extend([[], []])
-            kgs_definition_ids[kg].extend([[], []])
     else:
         tokens.append("[SEP]")
         segment_ids.append(0)
         for kg in use_kg:
             kgs_concept_ids[kg].append([])
-            kgs_definition_ids[kg].append([])
 
-    return tokens, segment_ids, kgs_concept_ids, kgs_definition_ids
+    return tokens, segment_ids, kgs_concept_ids
 
 
 def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tokenizer):
@@ -1469,7 +1346,7 @@ def create_tensordataset(features, is_training, args, retrievers, tokenizer, rel
     id2concept, concept2id, concept_embedding_mat = read_concept_embedding(concept_embedding_path)
 
     offset_to_wn18name_dict = {}
-    fin = open(os.path.join("../../data/kgs/",
+    fin = open(os.path.join("./data/kgs/",
                             'wordnet-mlj12-definitions.txt'))
     for line in fin:
         info = line.strip().split('\t')
@@ -1483,46 +1360,21 @@ def create_tensordataset(features, is_training, args, retrievers, tokenizer, rel
     if args.model_type == "kelm":
         # get mapping relation between src to dst list each relation
         multi_relation_dict = retrive_multi_relation_dict(relation_list, wn18_dir)
-        if not args.is_parallel_for_dgl_preprocess:
-            all_kgs_graphs = []
-            logger.info("testing graph_collecter function")
-            for f in tqdm(features, desc="build dgl graph", disable=not tqdm_enabled, ):
-                g = graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer,
-                                    multi_relation_dict, retrievers["wordnet"], encoder, defid2def, conceptid2defid,
-                                    speed_up_version=args.speed_up_version)
-                all_kgs_graphs.append(g)
-        else:
-            threads = min(args.threads, cpu_count())
-            logger.info("Using {} threads to build {} graphs".format(threads, "train" if is_training else "dev"))
-            # features = features[:5]
-            with Pool(threads, initializer=convert_example_to_features_init,
-                      initargs=(tokenizer, multi_relation_dict,)) as p:
-                annotate_ = partial(
-                    graph_collecter,
-                    wn18_dir=wn18_dir,
-                    offset_to_wn18name_dict=offset_to_wn18name_dict,
-                    concept2id=concept2id,
-                    relation_list=relation_list,
-                    tokenizer=tokenizer,
-                    multi_relation_dict=multi_relation_dict,
-                )
-                all_kgs_graphs = list(
-                    tqdm(
-                        p.imap(annotate_, features, chunksize=args.chunksize_for_graph),
-                        total=len(features),
-                        desc="build dgl graph",
-                        disable=not tqdm_enabled,
-                    )
-                )
-            # all_kgs_graphs = [item[0] for item in results if len(item[0])>0]
+        all_kgs_graphs = []
+        for f in tqdm(features, desc="build dgl graph", disable=not tqdm_enabled, ):
+            for c_id, syn in f.kgs_conceptids2synset["wordnet"].items():
+                if c_id in retrievers["wordnet"].conceptids2synset:
+                    continue
+                retrievers["wordnet"].conceptids2synset[c_id] = syn
+
+            g = graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer,
+                                multi_relation_dict, retrievers["wordnet"], encoder, defid2def, conceptid2defid,
+                                )
+            all_kgs_graphs.append(g)
     else:
         all_kgs_graphs = None
 
     assert len(conceptid2defid) == len(defid2def)
-    # if args.speed_up_version == "v2":
-    #     defid2defembed = encoder(**tokenizer(defid2def, return_tensors="pt", padding=True).to(encoder.device))[1]
-    # else:
-    #     defid2defembed = defid2def
 
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_attention_masks = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
@@ -1595,7 +1447,7 @@ def retrive_multi_relation_dict(relation_list, wn18_dir):
 
 
 def graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer, multi_relation_dict,
-                    retrievers, encoder, defid2def, conceptid2defid, speed_up_version):
+                    retrievers, encoder, defid2def, conceptid2defid):
     nell_src = []
     nell_dst = []
     nell_conceptid2nodeid = {}
@@ -1688,29 +1540,10 @@ def graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_l
                                                           dtype=torch.long)
 
     # assign bert tokenize id
-    if speed_up_version == "v1":
-        wn_definition_embedding_list = get_definition_embedding(RelationalGraphBuilder.wn_nodeid2conceptid,
-                                                                RelationalGraphBuilder.wn_conceptids2synset, tokenizer,
-                                                                encoder,
-                                                                defid2def, conceptid2defid)
-        # logger.info(wn_definition_embedding_list.shape)
-        g.nodes['wn_concept_id'].data["definition_embedding"] = wn_definition_embedding_list.cpu()
-
-    elif speed_up_version == "v2":
-        wn_defid_list = get_definition_ids(RelationalGraphBuilder.wn_nodeid2conceptid,
-                                           RelationalGraphBuilder.wn_conceptids2synset, tokenizer, encoder,
-                                           defid2def, conceptid2defid)
-        g.nodes['wn_concept_id'].data["definition_id"] = torch.tensor(wn_defid_list)
-
-    else:
-        # assign bert tokenize id
-        wn_tokenized_definition = get_tokenized_definition(RelationalGraphBuilder.wn_nodeid2conceptid,
-                                                           RelationalGraphBuilder.wn_conceptids2synset, tokenizer)
-        g.nodes['wn_concept_id'].data["definition_input_ids"] = torch.tensor(wn_tokenized_definition["input_ids"])
-        g.nodes['wn_concept_id'].data["definition_attention_mask"] = torch.tensor(
-            wn_tokenized_definition["attention_mask"])
-    # g.nodes['wn_concept_id'].data["definition_input_ids"] = torch.tensor(wn_tokenized_definition["input_ids"])
-    # g.nodes['wn_concept_id'].data["definition_attention_mask"] = torch.tensor(wn_tokenized_definition["attention_mask"])
+    wn_defid_list = get_definition_ids(RelationalGraphBuilder.wn_nodeid2conceptid,
+                                       RelationalGraphBuilder.wn_conceptids2synset, tokenizer, encoder,
+                                       defid2def, conceptid2defid)
+    g.nodes['wn_concept_id'].data["definition_id"] = torch.tensor(wn_defid_list)
 
     for i, id_type in enumerate(id_type_list):
         wn_relation_nodeid2conceptid = builder_list[i].wn_relation_nodeid2conceptid
@@ -1719,29 +1552,10 @@ def graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_l
             g.nodes[id_type].data["definition_id"] = torch.tensor([])
             # logger.info("{} is empty".format(id_type))
         else:
-            if speed_up_version == "v1":
-                relation_definition_embedding_list = get_definition_embedding(wn_relation_nodeid2conceptid,
-                                                                              RelationalGraphBuilder.wn_conceptids2synset,
-                                                                              tokenizer,
-                                                                              encoder, defid2def, conceptid2defid)
-                # logger.info(relation_definition_embedding_list.shape)
-                g.nodes[id_type].data["definition_embedding"] = relation_definition_embedding_list.cpu()
-
-            elif speed_up_version == "v2":
-
-                relation_defid_list = get_definition_ids(wn_relation_nodeid2conceptid,
-                                                         RelationalGraphBuilder.wn_conceptids2synset, tokenizer,
-                                                         encoder, defid2def, conceptid2defid)
-                g.nodes[id_type].data["definition_id"] = torch.tensor(relation_defid_list)
-
-            else:
-                relation_tokenized_definition = get_tokenized_definition(wn_relation_nodeid2conceptid,
-                                                                         RelationalGraphBuilder.wn_conceptids2synset,
-                                                                         tokenizer)
-                g.nodes[id_type].data["definition_input_ids"] = torch.tensor(relation_tokenized_definition["input_ids"])
-                g.nodes[id_type].data["definition_attention_mask"] = torch.tensor(
-                    relation_tokenized_definition["attention_mask"])
-
+            relation_defid_list = get_definition_ids(wn_relation_nodeid2conceptid,
+                                                     RelationalGraphBuilder.wn_conceptids2synset, tokenizer,
+                                                     encoder, defid2def, conceptid2defid)
+            g.nodes[id_type].data["definition_id"] = torch.tensor(relation_defid_list)
     return g
 
 
@@ -1760,24 +1574,9 @@ def get_definition_ids(nodeid2conceptid, conceptids2synset, tokenizer, encoder, 
             defid2def.append(def_sentence)
         except:
             logger.warning("error!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! wronng concept synset")
-
             exit()
 
     return defid_list
-
-
-def get_definition_embedding(nodeid2conceptid, conceptids2synset, tokenizer, encoder):
-    kg_definition_list = []
-    for concept_id in nodeid2conceptid:
-        try:
-            def_sentence = wn.synset(conceptids2synset[concept_id]).definition()
-            kg_definition_list.append(def_sentence)
-        except:
-            logger.warning("error!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! wronng concept synset")
-            exit()
-    embedding_list = encoder(**tokenizer(kg_definition_list, return_tensors="pt", padding=True).to(encoder.device))[1]
-    return embedding_list
-
 
 def get_tokenized_definition(nodeid2conceptid, conceptids2synset, tokenizer):
     kg_definition_list = []
@@ -1865,11 +1664,11 @@ def get_final_text(pred_text, orig_text, tokenizer, verbose=False):
     else:
         tok_text = tokenizer.convert_tokens_to_string(tokenizer.tokenize(orig_text))
 
-    start_position = orig_text.find(pred_text)
+    start_position = tok_text.find(pred_text)
     if start_position == -1:
         if verbose:
             logger.info("Unable to find text: '%s' in '%s'" % (pred_text, orig_text))
-        return pred_text.strip()
+        return orig_text
     end_position = start_position + len(pred_text) - 1
 
     (orig_ns_text, orig_ns_to_s_map) = _strip_spaces(orig_text)
@@ -1921,8 +1720,6 @@ def find_nbest_start_end_logit(result, n_best_size, max_answer_length, feature, 
             # invalid predictions.
             if end_index < start_index:
                 continue
-            # make sure the start_index and end_index are in doc_span, tokid_span_to_orig_map[0] is end position of
-            # query tokens and feature.tokid_span_to_orig_map[2] is the length of doc span(subtokens level)
             if start_index >= min(len(feature.tokens),
                                   feature.tokid_span_to_orig_map[0] + feature.tokid_span_to_orig_map[2]):
                 continue
@@ -1970,9 +1767,7 @@ def find_nbest_prediction_for_example(prelim_predictions, n_best_size, example, 
             if isinstance(tokenizer, RobertaTokenizer):
                 tok_text = tokenizer.convert_tokens_to_string(tok_tokens).strip()
             elif isinstance(tokenizer, BertTokenizer):
-                tok_text = " ".join(tok_tokens)
-                tok_text = tok_text.replace(" ##", "")
-                tok_text = tok_text.replace("##", "")
+                tok_text = tokenizer.convert_tokens_to_string(tok_tokens)
                 tok_text = tok_text.strip()
                 tok_text = " ".join(tok_text.split())
 
@@ -2067,16 +1862,6 @@ def roberta_from_string_to_subtokens(subtokens, tokenizer):
         cur_len += cur_tok_len
         to_check = False
     return text_from_sub, ori_to_sub_map, sub_to_ori_map
-
-
-def check_definition_list(d):
-    for i in range(len(d)):
-        if not isinstance(d[i], list):
-            print("wrong_type{}".format(i))
-        for j in range(len(d[i])):
-            if not isinstance(d[i][j], list) or d[i][j][0] != 101:
-                print("wrong_type{}   {}".format(i, j))
-
 
 def check_concept_list(w):
     for i in range(len(w)):

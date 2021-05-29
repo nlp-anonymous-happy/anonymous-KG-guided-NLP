@@ -1,0 +1,13 @@
+outputs/*
+!/outputs/.gitkeep
+cache/*
+!/cache/.gitkeep
+!/cache/record_test_script_test_definition_embedding_mat
+runs/*
+!/runs/.gitkeep
+log/*
+!/log/.gitkeep
+src/runs/*
+checkpoint/*
+!/checkpoint/.gitkeep
+/.idea/

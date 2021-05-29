@@ -49,7 +49,6 @@ class NellRetriever(KGRetriever):
         self.score_threshold = 0.9
         self.name = "nell"
         self.max_concept_length = 0
-        self.max_definition_length = 0
 
         # load kg embddings.
         logger.info("Loading KG embeddings for nell.")

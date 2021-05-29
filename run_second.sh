@@ -3,7 +3,7 @@ mkdir log
 fi
 
 DATA_DIR=./data/
-INIT_DIR=./checkpoint/
+INIT_DIR=./outputs/new_exp_first/checkpoint-21000/
 CACHE_DIR=./cache/
 CACHE_STORE_DIR=./cache/
 Model_name_or_path=./cache/bert-large-cased/
@@ -13,30 +13,31 @@ WN18_DIR=./data/kgs/wn18/text/
 TRAIN_FILE=record/train.json
 PRED_FILE=record/dev.json
 
-mark=new_exp
-mark_r=${mark}_train_first
+mark=new_exp_second
+mark_r=${mark}_train_second
 
 OUTPUT_DIR=./outputs/${mark}
 Tensorboard_dir=./runs
+PWD_DIR=`pwd`
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
-  --cache_file_suffix test_4 \
+CUDA_VISIBLE_DEVICES=1,2,3,7 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
+  --cache_file_suffix full_test_2 \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
-  --warmup_steps 0 \
-  --max_steps 21000 \
+  --warmup_steps 510 \
+  --max_steps 8500 \
   --mark  $mark_r \
   --tensorboard_dir $Tensorboard_dir \
   --model_type kelm \
   --text_embed_model bert \
   --save_steps 2000 \
   --evaluate_steps 2000 \
-  --learning_rate 1e-3 \
-  --num_train_epochs 10 \
+  --learning_rate 2e-5 \
+  --num_train_epochs 4 \
   --threads 50 \
   --is_all_relation false \
-  --freeze true \
+  --freeze false \
   --init_dir $INIT_DIR \
   --cache_dir $CACHE_DIR \
   --output_dir $OUTPUT_DIR \
@@ -54,5 +55,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node
   --do_train true \
   --do_eval false \
   --do_lower_case false \
-  --is_parallel_for_dgl_preprocess false \
-  --seed 45
+  --full_table false \
+  --use_context_graph false \
+  --use_wn true \
+  --use_nell true \
+  --seed 45 1>$PWD_DIR/log/kelm.${mark_r} 2>&1

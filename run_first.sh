@@ -13,14 +13,15 @@ WN18_DIR=./data/kgs/wn18/text/
 TRAIN_FILE=record/train.json
 PRED_FILE=record/dev.json
 
-mark=new_exp
+mark=new_exp_first
 mark_r=${mark}_train_first
 
 OUTPUT_DIR=./outputs/${mark}
 Tensorboard_dir=./runs
+PWD_DIR=`pwd`
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
-  --cache_file_suffix test_4 \
+CUDA_VISIBLE_DEVICES=1,2,3,7 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
+  --cache_file_suffix full_test_2 \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
@@ -54,5 +55,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node
   --do_train true \
   --do_eval false \
   --do_lower_case false \
-  --is_parallel_for_dgl_preprocess false \
-  --seed 45
+  --full_table false \
+  --use_context_graph false \
+  --use_wn true \
+  --use_nell true \
+  --seed 45 1>$PWD_DIR/log/kelm.${mark_r} 2>&1

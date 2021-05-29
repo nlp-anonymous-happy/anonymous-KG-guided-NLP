@@ -3,7 +3,7 @@ mkdir log
 fi
 
 DATA_DIR=./data/
-INIT_DIR=./checkpoint/
+INIT_DIR=./checkpoint/checkpoint/
 CACHE_DIR=./cache/
 CACHE_STORE_DIR=./cache/
 Model_name_or_path=./cache/bert-large-cased/
@@ -13,14 +13,15 @@ WN18_DIR=./data/kgs/wn18/text/
 TRAIN_FILE=record/train.json
 PRED_FILE=record/dev.json
 
-mark=new_exp
-mark_r=${mark}_train_first
+mark=val_set_2
+mark_r=${mark}_for_checkpoint
 
 OUTPUT_DIR=./outputs/${mark}
 Tensorboard_dir=./runs
+PWD_DIR=`pwd`
 
-CUDA_VISIBLE_DEVICES=6 python -m torch.distributed.launch --nproc_per_node=1 --master_port=83499 src/run_record_test.py \
-  --cache_file_suffix test_5 \
+CUDA_VISIBLE_DEVICES=3 python -m torch.distributed.launch --nproc_per_node=1 --master_port=83499 src/run_record_test.py \
+  --cache_file_suffix val_for_checkpoint_2 \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
@@ -49,10 +50,14 @@ CUDA_VISIBLE_DEVICES=6 python -m torch.distributed.launch --nproc_per_node=1 --m
   --train_file $TRAIN_FILE \
   --predict_file $PRED_FILE \
   --evaluate_during_training true \
-  --data_preprocess false \
-  --data_preprocess_evaluate false \
+  --data_preprocess true \
+  --data_preprocess_evaluate true \
   --do_train true \
   --do_eval false \
   --do_lower_case false \
-  --is_parallel_for_dgl_preprocess false \
-  --seed 45
+  --full_table false \
+  --use_context_graph false \
+  --use_wn true \
+  --use_nell true \
+  --test false \
+  --seed 45 1>$PWD_DIR/log/kelm.${mark_r} 2>&1

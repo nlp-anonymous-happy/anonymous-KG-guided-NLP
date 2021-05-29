@@ -9,8 +9,6 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, KLDivLoss, MSELoss
 from transformers import (
     PretrainedConfig,
-    BertModel, BertTokenizer, BertConfig,
-    RobertaModel, RobertaTokenizer, RobertaConfig,
     AutoTokenizer,
     AutoConfig,
     AutoModel
@@ -37,27 +35,21 @@ class KELMConfig(PretrainedConfig):
     ):
         # the base text embedding model configuratoin
         super().__init__(pad_token_id=pad_token_id)
-        self.speed_up_version = kwargs.get("speed_up_version")
         self.wn_def_embed_mat_dir = kwargs.get("wn_def_embed_mat_dir")
         self.text_embed_model = kwargs.get("text_embed_model", None)
-        self.use_context_graph = kwargs.get("use_context_graph")
-
         self.config_name = kwargs.get("config_name", "")
-        # logger.info("KELM config name: {}".format(self.config_name))
+        self.use_context_graph = kwargs.get("use_context_graph")
+        self.use_wn = kwargs.get("use_wn")
+        self.use_nell = kwargs.get("use_nell")
+
         self.model_name_or_path = kwargs.get("model_name_or_path", "")
         self.cache_dir = kwargs.get("cache_dir", "")
 
-        # if self.text_embed_model == "bert":
-        #     self.base_config = BertConfig.from_pretrained(self.config_name if self.config_name else self.model_name_or_path,cache_dir=self.cache_dir)
-        # elif self.text_embed_model == "roberta":
-        #     self.base_config = RobertaConfig.from_pretrained(self.config_name, cache_dir= self.cache_dir)
         self.base_config = AutoConfig.from_pretrained(
             self.config_name if self.config_name else self.model_name_or_path,
             # cache_dir=self.cache_dir if self.cache_dir else None,
         )
-        # self.config_name = "_".join(self.config_name.split("-"))
         init_dir = kwargs.get("init_dir", "")
-        # self.pretrained_path = init_dir if len(init_dir) > 1 else None
 
         # the kg-related configurations
         self.use_kgs = kwargs.get("use_kgs", dict())
@@ -66,7 +58,6 @@ class KELMConfig(PretrainedConfig):
         if kgretrievers is not None:
             self.add_kgretrievers(kgretrievers)
 
-        self.mem_method = kwargs.get("mem_method", "raw")
         self.initializer_range = kwargs.get("initializer_range", 0.02)
         self.output_attentions = False
         self.output_hidden_states = False
@@ -78,8 +69,11 @@ class KELMConfig(PretrainedConfig):
         self.cat_twotime_mul = kwargs.get("cat_twotime_mul", True)
         self.cat_twotime_sub = kwargs.get("cat_twotime_sub", False)
         self.set_sizes()
-
+        self.use_consistent_loss_wn = kwargs.get("use_consistent_loss_wn", False)
+        self.warm_up = kwargs.get("warm_up", 10000)
+        self.consistent_loss_wn_coeff = kwargs.get("consistent_loss_wn_coeff", 0.2)
         self.freeze = kwargs.get("freeze")
+        self.consistent_loss_type = kwargs.get("consistent_loss_type")
 
         self.relation_list = kwargs.get("relation_list")
         self.relation_agg = kwargs.get("relation_agg")
@@ -109,7 +103,11 @@ class KELMConfig(PretrainedConfig):
     ):
         # the base text embedding model configuratoin
         kwargs = dict()
+        kwargs['use_consistent_loss_wn'] = args.use_consistent_loss_wn
+        kwargs['warm_up'] = args.warm_up
+        kwargs['consistent_loss_wn_coeff'] = args.consistent_loss_wn_coeff
         kwargs['freeze'] = args.freeze
+        kwargs['consistent_loss_type'] = args.consistent_loss_type
 
         kwargs['text_embed_model'] = args.text_embed_model
         kwargs['config_name'] = args.config_name
@@ -117,7 +115,6 @@ class KELMConfig(PretrainedConfig):
         kwargs['cache_dir'] = args.cache_dir
         kwargs['init_dir'] = args.init_dir
         kwargs['use_kgs'] = args.use_kgs
-        kwargs['mem_method'] = args.mem_method
         kwargs['cat_mul'] = args.cat_mul
         kwargs['cat_sub'] = args.cat_sub
         kwargs['cat_twotime'] = args.cat_twotime
@@ -127,9 +124,10 @@ class KELMConfig(PretrainedConfig):
         kwargs["relation_list"] = args.relation_list
         kwargs["relation_agg"] = args.relation_agg
 
-        kwargs["speed_up_version"] = args.speed_up_version
         kwargs["wn_def_embed_mat_dir"] = args.wn_def_embed_mat_dir
         kwargs["use_context_graph"] = args.use_context_graph
+        kwargs["use_wn"] = args.use_wn
+        kwargs["use_nell"] = args.use_nell
 
         return KELMConfig(kgretrievers=kgretrievers, **kwargs)
 
@@ -161,13 +159,6 @@ class KELMConfig(PretrainedConfig):
             output['retrievers'][kg] = retriever.to_dict()
         return output
 
-    # @classmethod
-    # def from_pretrained(cls, cache_dir):
-    #     return torch.load(cache_dir)
-    #
-    # def save_pretrained(self, save_directory: str):
-    #     torch.save(self, save_directory)
-
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any], **kwargs) -> "PretrainedConfig":
         return_unused_kwargs = kwargs.pop("return_unused_kwargs", False)
@@ -175,7 +166,6 @@ class KELMConfig(PretrainedConfig):
         retrievers = dict()
         for key, kg_args in config_dict['retrievers'].items():
             file_path = kg_args['file_path']
-            # file_path = "."+kg_args['file_path'] # when running test_metrics.py
             retrievers[key] = initialize_kg_retriever(key, file_path)
             max_length = kg_args['max_concept_length']
             retrievers[key].update_max_concept_length(max_length)
@@ -289,11 +279,13 @@ class KELM(nn.Module):
         super().__init__()
         self.config = config
         self.use_context_graph = self.config.use_context_graph
-        self.use_kgs = self.config.use_kgs
+        self.use_wn = self.config.use_wn
+        self.use_nell = self.config.use_nell
+
         self.text_embed_model = None
         logger.info("***** Initializing KELM model *****")
         logger.info(
-            "Building the first layer Text embedding layer with type {} and size {}".format(config.text_embed_model,
+            "Building the first layer PLM embedding layer with type {} and size {}".format(config.text_embed_model,
                                                                                             config.text_embed_size))
 
         self.text_embed_model = AutoModel.from_pretrained(config.model_name_or_path,
@@ -306,8 +298,6 @@ class KELM(nn.Module):
                 param.requires_grad = False
 
         for kg, retriever in config.retrievers.items():
-            # if kg == "nell":
-            #     self.nell_embed_mat = retriever.get_embedding_mat()
             if kg == "wordnet":
                 wn_embed_mat = retriever.get_embedding_mat()
 
@@ -328,17 +318,10 @@ class KELM(nn.Module):
                                               concept_embed_size)  # embed the concept_ids to concept_embeddings
                 self.nell_embedding.weight.data.copy_(torch.from_numpy(nell_embed_mat))
                 self.nell_embedding.weight.requires_grad = False
-        if self.use_context_graph:
-            wn_def_embed_mat = torch.load(config.wn_def_embed_mat_dir)["definition_embedding_mat"]
-            logger.info("wn_def_embed_mat shape: {}".format(wn_def_embed_mat.shape))
-            # self.wn_def_embedding = nn.Embedding(31863,
-            #                                  1024)
 
-            self.wn_def_embedding = nn.Embedding(wn_def_embed_mat.shape[0],
-                                                 wn_def_embed_mat.shape[1])
-            self.wn_def_embedding.weight.data.copy_(wn_def_embed_mat)
-
-            self.wn_def_embedding.weight.requires_grad = False
+        self.wn_def_embedding = nn.Embedding(31863, 1024)
+        # self.wn_def_embedding.weight.data.copy_(wn_def_embed_mat)
+        self.wn_def_embedding.weight.requires_grad = False
 
         if config.text_embed_model == "bert" or config.text_embed_model == "roberta":
             self.rgcn_output_size = 1024
@@ -354,80 +337,67 @@ class KELM(nn.Module):
             logger.warning("not recongize embed model, program exit")
             exit()
 
-        num_part = self.use_context_graph + len(self.use_kgs)
-        self.memory_output_size = self.bert_embedding_size + self.concept_embed_size * num_part
+        self.memory_output_size = self.bert_embedding_size + self.concept_embed_size * (self.use_context_graph+self.use_wn+self.use_nell)
         self.output_length = 6 * self.memory_output_size
 
-
-        logger.info("Building the third layer: Self-Matching Layer with size {}".format(config.memory_output_size))
         self.self_matching = SelfMatching(self.memory_output_size, cat_mul=config.cat_mul,
                                           cat_sub=config.cat_sub, cat_twotime=config.cat_twotime,
                                           cat_twotime_mul=config.cat_twotime_mul,
                                           cat_twotime_sub=config.cat_twotime_sub)
 
-        logger.info("Building the rgcn layer")
-
         gnn_relation_list = ['self_connection']
-        logger.warning("gnn_relation_list: {}".format(gnn_relation_list))
         for i in self.config.relation_list:
             gnn_relation_list.append(i+'_')
-        logger.warning("gnn_relation_list: {}".format(gnn_relation_list))
 
-        if self.use_context_graph:
-            self.rgcn_context = multi_relation_net.RGAT(self.bert_embedding_size,
-                                                    self.bert_embedding_size,
-                                                    self.bert_embedding_size,
-                                                    rel_names=gnn_relation_list,
-                                                    relation_agg=self.config.relation_agg,
-                                                    att_out_feats=self.bert_embedding_size,
-                                                        )
+        self.rgcn_context = multi_relation_net.RGAT(self.bert_embedding_size,
+                                                self.bert_embedding_size,
+                                                self.bert_embedding_size,
+                                                rel_names=gnn_relation_list,
+                                                relation_agg=self.config.relation_agg,
+                                                att_out_feats=self.bert_embedding_size,
+                                                    )
 
-            self.gat_context = multi_relation_net.GAT(num_layers=1,
-                                                      in_dim=self.bert_embedding_size,
-                                                      num_hidden=self.concept_embed_size,
-                                                      heads=[1],
-                                                      feat_drop=0,
-                                                      attn_drop=0,
-                                                      negative_slope=0.2,
-                                                      activation=None,
-                                                      residual=False)
+        self.rgcn_wn = multi_relation_net.RGAT(self.concept_embed_size,
+                                                self.concept_embed_size,
+                                                self.concept_embed_size,
+                                                rel_names=gnn_relation_list,
+                                                relation_agg=self.config.relation_agg,
+                                                att_out_feats=self.concept_embed_size,
+                                               )
 
-        for kg in self.use_kgs:
-            if kg == "wordnet":
-                self.rgcn_wn = multi_relation_net.RGAT(self.concept_embed_size,
-                                                        self.concept_embed_size,
-                                                        self.concept_embed_size,
-                                                        rel_names=gnn_relation_list,
-                                                        relation_agg=self.config.relation_agg,
-                                                        att_out_feats=self.concept_embed_size,
-                                                       )
-
-                self.gat_wn = multi_relation_net.GAT(num_layers=1,
-                                                     in_dim=self.concept_embed_size,
-                                                     num_hidden=self.concept_embed_size,
-                                                     heads=[1],
-                                                     feat_drop=0,
-                                                     attn_drop=0,
-                                                     negative_slope=0.2,
-                                                     activation=None,
-                                                     residual=False)
-            if kg=="nell":
-                self.gat_nell = multi_relation_net.GAT(num_layers=1,
-                                                       in_dim=self.concept_embed_size,
-                                                       num_hidden=self.concept_embed_size,
-                                                       heads=[1],
-                                                       feat_drop=0,
-                                                       attn_drop=0,
-                                                       negative_slope=0.2,
-                                                       activation=None,
-                                                       residual=False)
-
-        logger.info("Building the fourth layer: Output Layer")
         # self.graph_qa_kt_outputs = nn.Linear(2*(self.bert_embedding_size+self.concept_embed_size), 2)
         self.qa_kt_outputs = nn.Linear(self.output_length, 2)
         self.qa_kt_outputs.weight.data.normal_(0, config.initializer_range)
 
-        logger.info("Building projector layer")
+        self.gat_wn = multi_relation_net.GAT(num_layers=1,
+                                          in_dim=self.concept_embed_size,
+                                          num_hidden=self.concept_embed_size,
+                                          heads=[1],
+                                          feat_drop=0,
+                                          attn_drop=0,
+                                          negative_slope=0.2,
+                                          activation=None,
+                                          residual=False)
+
+        self.gat_context = multi_relation_net.GAT(num_layers=1,
+                                          in_dim=self.bert_embedding_size,
+                                          num_hidden=self.concept_embed_size,
+                                          heads=[1],
+                                          feat_drop=0,
+                                          attn_drop=0,
+                                          negative_slope=0.2,
+                                          activation=None,
+                                          residual=False)
+
+        self.gat_nell = multi_relation_net.GAT(num_layers=1,
+                                          in_dim=self.concept_embed_size,
+                                          num_hidden=self.concept_embed_size,
+                                          heads=[1],
+                                          feat_drop=0,
+                                          attn_drop=0,
+                                          negative_slope=0.2,
+                                          activation=None,
+                                          residual=False)
 
         self.projected_token_text = nn.Linear(self.bert_embedding_size, self.concept_embed_size,
                                                   bias=False)  # map the bert encoding to the pre-defined dimension.
@@ -437,10 +407,6 @@ class KELM(nn.Module):
                                                   bias=False)  # map the bert encoding to the pre-defined dimension.
         self.projected_token_text_nell.weight.data.normal_(0, config.initializer_range)
         # self.init_weights()
-        logger.info("***** The parameters information in KELM *****")
-        logger.info(" The shape of text embed : {}".format(config.text_embed_size))
-        logger.info(" The shape of memory output : {}".format(config.memory_output_size))
-        logger.info(" The shape of last layer: {}".format(config.output_length))
 
     def _init_weights(self, module):
         """ Initialize the weights """
@@ -453,21 +419,25 @@ class KELM(nn.Module):
         #     module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
-        
-    def update_definition_embedding_mat(self, definition_embedding_mat):
-        # wn_def_embed_mat = definition_embedding_mat
 
-        logger.info("definition_embedding_mat {}".format(definition_embedding_mat))
+    def update_defid2defembed(self, defid2defembed, memory_bank_keep_coef):
+        # wn_def_embed_mat = defid2defembed
+
+        logger.info("defid2defembed {}".format(defid2defembed))
         logger.info("og weight {}".format(self.wn_def_embedding.weight.data))
 
-        self.wn_def_embedding = nn.Embedding(definition_embedding_mat.shape[0],
-                                             definition_embedding_mat.shape[1])
-
-        self.wn_def_embedding.weight.data.copy_(definition_embedding_mat)
+        #
+        # self.wn_def_embedding = nn.Embedding(wn_def_embed_mat.shape[0],
+        #                                      wn_def_embed_mat.shape[1])
+        if memory_bank_keep_coef:
+            logger.info("keep {} og value".format(memory_bank_keep_coef))
+            defid2defembed = memory_bank_keep_coef * self.wn_def_embedding.weight.data + (1-memory_bank_keep_coef) * defid2defembed
+        self.wn_def_embedding.weight.data.copy_(defid2defembed)
         self.wn_def_embedding.weight.requires_grad = False
         logger.info("current weight {}".format(self.wn_def_embedding.weight.data))
 
         # self.wn_def_embedding.to(self.text_embed_model.device)
+
 
     def forward(self, **kwargs):
         """
@@ -492,7 +462,7 @@ class KELM(nn.Module):
         batch_synset_graphs = [wn_synset_graphs[i] for i in batch_synset_graphs_id]
         batch_context_graphs_list = []
         batch_wn_graphs_list = []
-        batch_entity2token_graphs_wn_list = []
+        batch_entity2token_graphs_list = []
         batch_entity2token_graphs_nell_list = []
 
         token_length_list = []
@@ -535,103 +505,80 @@ class KELM(nn.Module):
                                                          id_type_list, context_type_list,
                                                          text_output[i, :, :], input_ids.device)
 
-            entity2token_graph = self.construct_entity2token_graph(i, g, text_output, input_ids.device)
+            entity2token_graph, entity2token_graph_nell = self.construct_entity2token_graph(i, g, text_output, input_ids.device)
 
-            if "wordnet" in self.use_kgs or self.use_context_graph:
-                batch_entity2token_graphs_wn_list.append(entity2token_graph["wordnet"])
-            if "nell" in self.use_kgs:
-                batch_entity2token_graphs_nell_list.append(entity2token_graph["nell"])
+            batch_entity2token_graphs_list.append(entity2token_graph)
+            batch_entity2token_graphs_nell_list.append(entity2token_graph_nell)
             batch_context_graphs_list.append(context_g)
             batch_wn_graphs_list.append(wn_g)
 
+        batch_context_graphs_dgl = dgl.batch(batch_context_graphs_list)
+        graph_context_embedding = self.rgcn_context(batch_context_graphs_dgl, batch_context_graphs_dgl.ndata['feature'])
+        batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature"] = graph_context_embedding[
+            "wn_concept_context"]
+        # batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature_project"] = self.bert_projected_token_ids(
+        #     graph_context_embedding["wn_concept_context"])
+        batch_context_graphs_list = dgl.unbatch(batch_context_graphs_dgl)
+
+        batch_wn_graphs_dgl = dgl.batch(batch_wn_graphs_list)
+        graph_wn_embedding = self.rgcn_wn(batch_wn_graphs_dgl, batch_wn_graphs_dgl.ndata['feature'])
+        batch_wn_graphs_dgl.nodes["wn_concept_id"].data["feature"] = graph_wn_embedding["wn_concept_id"]
+        batch_wn_graphs_list = dgl.unbatch(batch_wn_graphs_dgl)
+
         memory_output_new = text_output
+        # batch_entity2token_graphs_list_homo_s = []
+        context_embed_new = torch.zeros(
+            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+            dtype=torch.float32, device=input_ids.device)
+        concept_embed_new = torch.zeros(
+            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+            dtype=torch.float32, device=input_ids.device)
 
-        if self.use_context_graph:
-            batch_context_graphs_dgl = dgl.batch(batch_context_graphs_list)
-            graph_context_embedding = self.rgcn_context(batch_context_graphs_dgl, batch_context_graphs_dgl.ndata['feature'])
-            batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature"] = graph_context_embedding[
-                "wn_concept_context"]
-            # batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature_project"] = self.bert_projected_token_ids(
-            #     graph_context_embedding["wn_concept_context"])
-            batch_context_graphs_list = dgl.unbatch(batch_context_graphs_dgl)
-
-            context_embed_new = torch.zeros(
-                (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-                dtype=torch.float32, device=input_ids.device)
-
-        for kg in self.use_kgs:
-            if kg=="wordnet":
-                batch_wn_graphs_dgl = dgl.batch(batch_wn_graphs_list)
-                graph_wn_embedding = self.rgcn_wn(batch_wn_graphs_dgl, batch_wn_graphs_dgl.ndata['feature'])
-                batch_wn_graphs_dgl.nodes["wn_concept_id"].data["feature"] = graph_wn_embedding["wn_concept_id"]
-                batch_wn_graphs_list = dgl.unbatch(batch_wn_graphs_dgl)
-
-                concept_embed_new = torch.zeros(
-                    (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-                    dtype=torch.float32, device=input_ids.device)
-
-            if kg=="nell":
-                nell_embed_new = torch.zeros(
-                    (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-                    dtype=torch.float32, device=input_ids.device)
+        nell_embed_new = torch.zeros(
+            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+            dtype=torch.float32, device=input_ids.device)
 
         # start_time = time()
-        for idx, _ in enumerate(batch_synset_graphs):
-            if "wordnet" in self.use_kgs or self.use_context_graph:
-                g_e2t = batch_entity2token_graphs_wn_list[idx]
-            if self.use_context_graph:
-                g_e2t.nodes["wn_concept_id"].data["context_feature"] = batch_context_graphs_list[idx].nodes["wn_concept_context"].data["feature"]
-                g_e2t.nodes["sentinel_id"].data["context_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["context_feature"], device=input_ids.device)
-            if "wordnet" in self.use_kgs:
-                g_e2t.nodes["wn_concept_id"].data["id_feature"] = batch_wn_graphs_list[idx].nodes["wn_concept_id"].data["feature"]
-                g_e2t.nodes["token_id"].data["id_feature"] = self.projected_token_text(g_e2t.nodes["token_id"].data["context_feature"])
-                g_e2t.nodes["sentinel_id"].data["id_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["id_feature"], device=input_ids.device)
+        for idx, g_e2t in enumerate(batch_entity2token_graphs_list):
+            g_e2t.nodes["wn_concept_id"].data["context_feature"] = batch_context_graphs_list[idx].nodes["wn_concept_context"].data["feature"]
+            # logger.info("idx {}: {}".format(idx, g_e2t.nodes["wn_concept_id"].data["context_feature"]))
+            g_e2t.nodes["wn_concept_id"].data["id_feature"] = batch_wn_graphs_list[idx].nodes["wn_concept_id"].data["feature"]
+            g_e2t.nodes["token_id"].data["id_feature"] = self.projected_token_text(g_e2t.nodes["token_id"].data["context_feature"])
+            g_e2t.nodes["sentinel_id"].data["id_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["id_feature"], device=input_ids.device)
+            g_e2t.nodes["sentinel_id"].data["context_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["context_feature"], device=input_ids.device)
 
-            if self.use_context_graph and "wordnet" in self.use_kgs:
-                g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['id_feature', 'context_feature'])
-                g_e2t_homo.ndata['context_feature'] = self.gat_context(g_e2t_homo,
-                                 g_e2t_homo.ndata['context_feature'])
-                g_e2t_homo.ndata['id_feature'] = self.gat_wn(g_e2t_homo, g_e2t_homo.ndata['id_feature'])
-                tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
+            g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['id_feature', 'context_feature'])
+            g_e2t_homo.ndata['context_feature'] = self.gat_context(g_e2t_homo,
+                             g_e2t_homo.ndata['context_feature'])
+            g_e2t_homo.ndata['id_feature'] = self.gat_wn(g_e2t_homo, g_e2t_homo.ndata['id_feature'])
+            tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
 
-                concept_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data["id_feature"]
-                context_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data["context_feature"]
-            elif self.use_context_graph:
-                g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['context_feature'])
-                g_e2t_homo.ndata['context_feature'] = self.gat_context(g_e2t_homo,
-                                 g_e2t_homo.ndata['context_feature'])
-                tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
-                context_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data["context_feature"]
-            elif "wordnet" in self.use_kgs:
-                g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['id_feature'])
-                g_e2t_homo.ndata['id_feature'] = self.gat_wn(g_e2t_homo, g_e2t_homo.ndata['id_feature'])
-                tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
-                concept_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data["id_feature"]
+            tmp_argsort = torch.argsort(tmp_graph.ndata[dgl.NID]["token_id"] - tmp_graph.num_nodes("sentinel_id"))
+            concept_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
+                "id_feature"].index_select(0, tmp_argsort)
+            context_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
+                "context_feature"].index_select(0, tmp_argsort)
 
-            # test_id_embed(tmp_graph)
-            # batch_entity2token_graphs_list_homo_s.append(tmp_graph)
-            if "nell" in self.use_kgs:
-                g_e2t_nell = batch_entity2token_graphs_nell_list[idx]
-                g_e2t_nell_homo = dgl.to_homogeneous(g_e2t_nell, ndata=['id_feature'])
-                g_e2t_nell_homo.ndata['id_feature'] = self.gat_nell(g_e2t_nell_homo, g_e2t_nell_homo.ndata['id_feature'])
-                tmp_graph_nell = dgl.to_heterogeneous(g_e2t_nell_homo, g_e2t_nell.ntypes, g_e2t_nell.etypes)
-                nell_embed_new[idx, :tmp_graph_nell.num_nodes("token_id"), :] = tmp_graph_nell.nodes["token_id"].data["id_feature"]
-            # test_nell_id_embed(tmp_graph_nell)
+            g_e2t_nell = batch_entity2token_graphs_nell_list[idx]
+            g_e2t_nell_homo = dgl.to_homogeneous(g_e2t_nell, ndata=['id_feature'])
+            g_e2t_nell_homo.ndata['id_feature'] = self.gat_nell(g_e2t_nell_homo, g_e2t_nell_homo.ndata['id_feature'])
+            tmp_graph_nell = dgl.to_heterogeneous(g_e2t_nell_homo, g_e2t_nell.ntypes, g_e2t_nell.etypes)
+            nell_tmp_argsort = torch.argsort(tmp_graph_nell.ndata[dgl.NID]["token_id"] - tmp_graph_nell.num_nodes("sentinel_id") - tmp_graph_nell.num_nodes("nell_concept_id"))
+            nell_embed_new[idx, :tmp_graph_nell.num_nodes("token_id"), :] = tmp_graph_nell.nodes["token_id"].data["id_feature"].index_select(0, nell_tmp_argsort)
         # # logger.info("time for one by one: {}".format(time() - start_time))
-        if "nell" in self.use_kgs:
-            memory_output_new = torch.cat((memory_output_new, nell_embed_new), 2)
 
-        if self.use_context_graph and "wordnet" in self.use_kgs:
+        if self.use_nell:
+            memory_output_new = torch.cat((memory_output_new, nell_embed_new), 2)
+        if self.use_context_graph and self.use_wn:
             k_memory = torch.cat((concept_embed_new, context_embed_new), 2)
+        elif self.use_wn:
+            k_memory = concept_embed_new
         elif self.use_context_graph:
             k_memory = context_embed_new
-        elif "wordnet" in self.use_kgs:
-            k_memory = concept_embed_new
-        else:
-            k_memory = torch.tensor([], device=input_ids.device)
-        memory_output_new = torch.cat((memory_output_new, k_memory), 2)
+        if self.use_context_graph or self.use_wn:
+            memory_output_new = torch.cat((memory_output_new, k_memory), 2)
 
-        # 3rd: self-matching layer
+
         att_output = self.self_matching(memory_output_new,
                                         attention_mask.unsqueeze(2))  # [batch_size, max_seq_length, memory_output_size]
         # 4th layer: output layer
@@ -661,8 +608,10 @@ class KELM(nn.Module):
             end_loss = loss_fct(end_logits, end_positions)
             total_loss = (start_loss + end_loss) / 2
             loss_cls = total_loss.detach().clone()
-
-            loss_wn = torch.tensor(loss_wn, device=loss_cls.device)
+            if loss_wn:
+                total_loss = total_loss + self.config.consistent_loss_wn_coeff * loss_wn
+            else:
+                loss_wn = torch.tensor(loss_wn, device=loss_cls.device)
         loss_dic = {
             'loss_wn': loss_wn,
             'loss_cls': loss_cls,
@@ -673,97 +622,85 @@ class KELM(nn.Module):
         return ((total_loss,) + output + (loss_dic,)) if total_loss is not None else output
 
     def construct_entity2token_graph(self, i, g, text_output, device):
-        entity2token_graph = {}
+        data_dict = {
+            ("wn_concept_id", "synset_", "token_id"): g.edges(etype="synset_"),
+            ("sentinel_id", "sentinel", "token_id"): (g.nodes("token_id"), g.nodes("token_id")),
+        }
+        num_nodes_dict = {"token_id": g.num_nodes("token_id"), "sentinel_id": g.num_nodes("token_id"),
+                          "wn_concept_id": g.num_nodes("wn_concept_id"),}
+        entity2token_graph = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict).to(device)
+        entity2token_graph.nodes["token_id"].data["context_feature"] = text_output[i,
+                                                                       :entity2token_graph.num_nodes("token_id"), :]
 
-        if "wordnet" in self.use_kgs or self.use_context_graph:
-            # build wn attention graph
-            data_dict = {
-                ("wn_concept_id", "synset_", "token_id"): g.edges(etype="synset_"),
-                ("sentinel_id", "sentinel", "token_id"): (g.nodes("token_id"), g.nodes("token_id")),
-            }
-            num_nodes_dict = {"token_id": g.num_nodes("token_id"), "sentinel_id": g.num_nodes("token_id"),
-                              "wn_concept_id": g.num_nodes("wn_concept_id"),}
-            entity2token_graph_wn = dgl.heterograph(data_dict, num_nodes_dict=num_nodes_dict).to(device)
-            entity2token_graph_wn.nodes["token_id"].data["context_feature"] = text_output[i,
-                                                                           :entity2token_graph_wn.num_nodes("token_id"), :]
+        data_dict_nell = {
+            ("nell_concept_id", "belong_", "token_id"): g.edges(etype="belong_"),
+            ("sentinel_id", "sentinel", "token_id"): (g.nodes("token_id"), g.nodes("token_id")),
+        }
+        num_nodes_dict_nell = {"token_id": g.num_nodes("token_id"), "sentinel_id": g.num_nodes("token_id"),
+                          "nell_concept_id": g.num_nodes("nell_concept_id"),}
+        entity2token_graph_nell = dgl.heterograph(data_dict_nell, num_nodes_dict=num_nodes_dict_nell).to(device)
+        entity2token_graph_nell.nodes["token_id"].data["id_feature"] = self.projected_token_text_nell(
+            text_output[i, :entity2token_graph_nell.num_nodes("token_id"), :])
+        entity2token_graph_nell.nodes['nell_concept_id'].data["id_feature"] = self.nell_embedding(
+            g.nodes['nell_concept_id'].data["conceptid"].to(device))
 
-            entity2token_graph["wordnet"] = entity2token_graph_wn
-        if "nell" in self.use_kgs:
-            # build nell attention graph
-            data_dict_nell = {
-                ("nell_concept_id", "belong_", "token_id"): g.edges(etype="belong_"),
-                ("sentinel_id", "sentinel", "token_id"): (g.nodes("token_id"), g.nodes("token_id")),
-            }
-            num_nodes_dict_nell = {"token_id": g.num_nodes("token_id"), "sentinel_id": g.num_nodes("token_id"),
-                              "nell_concept_id": g.num_nodes("nell_concept_id"),}
-            entity2token_graph_nell = dgl.heterograph(data_dict_nell, num_nodes_dict=num_nodes_dict_nell).to(device)
-            entity2token_graph_nell.nodes["token_id"].data["id_feature"] = self.projected_token_text_nell(
-                text_output[i, :entity2token_graph_nell.num_nodes("token_id"), :])
-            entity2token_graph_nell.nodes['nell_concept_id'].data["id_feature"] = self.nell_embedding(
-                g.nodes['nell_concept_id'].data["conceptid"].to(device))
+        entity2token_graph_nell.nodes['sentinel_id'].data["id_feature"] = torch.zeros_like(
+            entity2token_graph_nell.nodes['token_id'].data["id_feature"], device=device)
 
-            entity2token_graph_nell.nodes['sentinel_id'].data["id_feature"] = torch.zeros_like(
-                entity2token_graph_nell.nodes['token_id'].data["id_feature"], device=device)
-
-            entity2token_graph["nell"] = entity2token_graph_nell
-
-        return entity2token_graph
+        return entity2token_graph, entity2token_graph_nell
 
     def reconstruct_dgl_graph(self, g, relation_list, inverse_relation_list, id_type_list, context_type_list,
                               text_output, device):
-        # reconstruct context graph
-        if self.use_context_graph:
-            context_data_dict = {
-                ("wn_concept_context", "self_connection", "wn_concept_context"): (
-                    g.nodes("wn_concept_id"), g.nodes("wn_concept_id")),
-            }
-            context_num_nodes_dict = {"wn_concept_context": g.num_nodes("wn_concept_id"), }
+        context_data_dict = {
+            ("wn_concept_context", "self_connection", "wn_concept_context"): (
+                g.nodes("wn_concept_id"), g.nodes("wn_concept_id")),
+        }
+        context_num_nodes_dict = {"wn_concept_context": g.num_nodes("wn_concept_id"), }
 
-            for index, relation_type in enumerate(relation_list):
-                context_data_dict[(context_type_list[index], inverse_relation_list[index], "wn_concept_context")] = \
-                    g.edges(etype=relation_type)[1], g.edges(etype=relation_type)[0]
+        for index, relation_type in enumerate(relation_list):
+            context_data_dict[(context_type_list[index], inverse_relation_list[index], "wn_concept_context")] = \
+                g.edges(etype=relation_type)[1], g.edges(etype=relation_type)[0]
 
-                context_num_nodes_dict[context_type_list[index]] = g.num_nodes(id_type_list[index])
+            context_num_nodes_dict[context_type_list[index]] = g.num_nodes(id_type_list[index])
 
-            context_g = dgl.heterograph(context_data_dict, num_nodes_dict=context_num_nodes_dict).to(device)
+        context_g = dgl.heterograph(context_data_dict, num_nodes_dict=context_num_nodes_dict).to(device)
 
+        # start_embed = time()
+        # context_g.nodes['wn_concept_context'].data["feature"] = self.wn_def_embed_mat[g.nodes['wn_concept_id'].data["definition_id"].numpy()].to(device)
+        context_g.nodes['wn_concept_context'].data["feature"] = self.wn_def_embedding(g.nodes['wn_concept_id'].data["definition_id"].to(device))
 
-            context_g.nodes['wn_concept_context'].data["feature"] = self.wn_def_embedding(g.nodes['wn_concept_id'].data["conceptid"].to(device))
+        for index, context_type in enumerate(context_type_list):
+            if not context_g.num_nodes(context_type):
+                continue
+            # context_g.nodes[context_type].data["feature"] = self.wn_def_embed_mat[g.nodes[id_type_list[index]].data["definition_id"].numpy()].to(device)
+            context_g.nodes[context_type].data["feature"] = self.wn_def_embedding(g.nodes[id_type_list[index]].data["definition_id"].to(device))
+        # time_for_embedding_list.append(time()-start_embed)
 
-            for index, context_type in enumerate(context_type_list):
-                if not context_g.num_nodes(context_type):
-                    continue
-                # context_g.nodes[context_type].data["feature"] = self.wn_def_embed_mat[g.nodes[id_type_list[index]].data["definition_id"].numpy()].to(device)
-                context_g.nodes[context_type].data["feature"] = self.wn_def_embedding(g.nodes[id_type_list[index]].data["conceptid"].to(device))
+        # reconstruct kge graph
+        wn_data_dict = {
+            ('wn_concept_id', 'self_connection', 'wn_concept_id'): (g.nodes("wn_concept_id"), g.nodes("wn_concept_id")),
+        }
+        num_nodes_dict = {"wn_concept_id": g.num_nodes("wn_concept_id"), }
 
-        else:
-            context_g = None
+        for i, relation_type in enumerate(relation_list):
+            wn_data_dict[(id_type_list[i], inverse_relation_list[i], "wn_concept_id")] = \
+                g.edges(etype=relation_type)[1], g.edges(etype=relation_type)[0]
 
-        if "wordnet" in self.use_kgs:
-            # reconstruct kge graph
-            wn_data_dict = {
-                ('wn_concept_id', 'self_connection', 'wn_concept_id'): (g.nodes("wn_concept_id"), g.nodes("wn_concept_id")),
-            }
-            num_nodes_dict = {"wn_concept_id": g.num_nodes("wn_concept_id"), }
+            num_nodes_dict[id_type_list[i]] = g.num_nodes(id_type_list[i])
 
-            for i, relation_type in enumerate(relation_list):
-                wn_data_dict[(id_type_list[i], inverse_relation_list[i], "wn_concept_id")] = \
-                    g.edges(etype=relation_type)[1], g.edges(etype=relation_type)[0]
+        wn_g = dgl.heterograph(wn_data_dict, num_nodes_dict=num_nodes_dict).to(device)
 
-                num_nodes_dict[id_type_list[i]] = g.num_nodes(id_type_list[i])
+        # start_retrive = time()
+        # wn_g.nodes['wn_concept_id'].data["feature"] = torch.tensor(
+        #     self.wn_embed_mat[g.nodes['wn_concept_id'].data["conceptid"].numpy()], device=device)
+        wn_g.nodes['wn_concept_id'].data["feature"] = self.wn_embedding(g.nodes['wn_concept_id'].data["conceptid"].to(device))
 
-            wn_g = dgl.heterograph(wn_data_dict, num_nodes_dict=num_nodes_dict).to(device)
-
-
-            wn_g.nodes['wn_concept_id'].data["feature"] = self.wn_embedding(g.nodes['wn_concept_id'].data["conceptid"].to(device))
-
-            for i, id_type in enumerate(id_type_list):
-                if not wn_g.num_nodes(id_type):
-                    continue
-
-                wn_g.nodes[id_type].data["feature"] = self.wn_embedding(g.nodes[id_type].data["conceptid"].to(device))
-        else:
-            wn_g = None
+        for i, id_type in enumerate(id_type_list):
+            if not wn_g.num_nodes(id_type):
+                continue
+            # wn_g.nodes[id_type].data["feature"] = torch.tensor(
+            #     self.wn_embed_mat[g.nodes[id_type].data["conceptid"].numpy()], device=device)
+            wn_g.nodes[id_type].data["feature"] = self.wn_embedding(g.nodes[id_type].data["conceptid"].to(device))
 
         return context_g, wn_g
 
@@ -807,51 +744,3 @@ def configure_tokenizer_model_kelm(args, logger, kgretrievers):
 
     return tokenizer, model
 
-    # return tokenizer, None
-
-
-def check_params(target, model):
-    a = True
-    for target_param, param in zip(target.parameters(), model.parameters()):
-        if not a:
-            break
-        logger.info("self.definition_embed_model.parameters()", target_param)
-        logger.info("self.text_embed_model.parameters()", param)
-
-def test_id_embed(graph, ):
-    token_ids_with_concept = graph.edges(etype=('wn_concept_id', 'synset_', 'token_id'))[1].unique()
-    combined = torch.cat((token_ids_with_concept, graph.nodes("token_id")))
-    uniques, counts = combined.unique(return_counts=True)
-    difference = uniques[counts == 1]
-    intersection = uniques[counts > 1]
-
-    logger.info("token_id context_feature token_ids_with_concept")
-    logger.info(torch.sum(graph.nodes["token_id"].data["context_feature"][token_ids_with_concept, :], dim=1))
-    logger.info("token_id context_feature difference")
-    logger.info(torch.sum(graph.nodes["token_id"].data["context_feature"][difference, :], dim=1))
-
-    logger.info("token_id id_feature token_ids_with_concept")
-    logger.info(torch.sum(graph.nodes["token_id"].data["id_feature"][token_ids_with_concept, :], dim=1))
-    logger.info("token_id id_feature difference")
-    logger.info(torch.sum(graph.nodes["token_id"].data["id_feature"][difference, :], dim=1))
-
-def test_nell_id_embed(graph, ):
-    try:
-        token_ids_with_concept = graph.edges(etype=('nell_concept_id', 'belong_', 'token_id'))[1].unique()
-        combined = torch.cat((token_ids_with_concept, graph.nodes("token_id")))
-        uniques, counts = combined.unique(return_counts=True)
-        difference = uniques[counts == 1]
-        intersection = uniques[counts > 1]
-
-        # logger.info("token_id context_feature token_ids_with_concept")
-        # logger.info(torch.sum(graph.nodes["token_id"].data["context_feature"][token_ids_with_concept, :], dim=1))
-        # logger.info("token_id context_feature difference")
-        # logger.info(torch.sum(graph.nodes["token_id"].data["context_feature"][difference, :], dim=1))
-
-        logger.info("token_id id_feature token_ids_with_concept")
-        logger.info(torch.sum(graph.nodes["token_id"].data["id_feature"][token_ids_with_concept, :], dim=1))
-        logger.info("token_id id_feature difference")
-        logger.info(torch.sum(graph.nodes["token_id"].data["id_feature"][difference, :], dim=1))
-    except:
-        logger.info("no concept")
-        logger.info(torch.sum(graph.nodes["token_id"].data["id_feature"], dim=1))

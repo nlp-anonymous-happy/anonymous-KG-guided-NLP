@@ -7,13 +7,11 @@ class KGRetriever(object):
         self.max_concept_length = 0
         self.name = "general_kg_retriever"
         self.concept_embedding_mat = [[]]
-        self.max_definition_length = 0
 
     def to_dict(self):
         output = dict()
         output['name'] = self.__dict__['name']
         output['max_concept_length'] = self.__dict__['max_concept_length']
-        output['max_definition_length'] = self.__dict__['max_definition_length']
         output['concept_vocab_size'] = self.get_concept_vocab_size()
         output['concept_embed_size'] = self.get_concept_embed_size()
         output['file_path'] = self.__dict__['filepath']
@@ -35,12 +33,6 @@ class KGRetriever(object):
 
     def id2concept_check(self, id):
         return self.id2concept[id]
-
-    def get_definition_max_length(self):
-        return self.max_definition_length
-    def update_max_definition_length(self, num):
-        self.max_definition_length = max(self.max_definition_length, num)
-
 
 def read_concept_embedding(embedding_path):
     fin = open(embedding_path, encoding='utf-8')
