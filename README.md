@@ -37,7 +37,7 @@ For NELL, name entity recognition is performed by [Standford CoreNLP](https://st
 
 For convenience, you can download all relative files from following google drive links:
 
- [link](https://drive.google.com/file/d/1J4fdA__4TOS6XQ6iN1ehDywB-qoVCoou/view?usp=sharing) unzip and replace ./data/
+ [link](https://drive.google.com/file/d/1Ax-xSw4QTaluhFqSTQbeNsxnU7YpDs_h/view?usp=sharing) unzip and replace ./data/
 
 ## Data Preprocess
 
@@ -79,7 +79,7 @@ We train 10 epochs for first stages and 4 epochs for second stages
 sh run_test.sh
 ```
 
-To reproduce the paper result, you can download our best checkpoint model: [KELM<sub>BOTH</sub>](https://drive.google.com/file/d/17UiDRgpCROtTJPRsBoOdpz6h19ShXayo/view?usp=sharing) unzip and move to ./checkpoint
+To reproduce the paper result, you can download our best checkpoint model: [KELM<sub>BOTH</sub>](https://drive.google.com/file/d/1J5OuXwS4X8QV_oip_abd-La__pw_eHiG/view?usp=sharing) unzip and move to ./checkpoint
 
 ## Results
 
