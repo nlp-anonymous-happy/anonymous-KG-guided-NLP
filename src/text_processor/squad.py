@@ -31,7 +31,7 @@ from torch.nn import CrossEntropyLoss
 from transformers import DataProcessor
 
 from text_processor import tokenization
-from utils.record_official_evaluate import *
+from utils.squad_1_1_evaluate import *
 from transformers import RobertaTokenizer, BertTokenizer
 import networkx as nx
 import dgl
@@ -55,6 +55,7 @@ _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
     "NbestPrediction", ["text", "start_logit", "end_logit", "start_index", "end_index"]
 )
 
+# remove_special_punc_count = 0
 
 class DefinitionInfo(object):
     def __init__(
@@ -68,9 +69,9 @@ class DefinitionInfo(object):
         # self.defid2defembed = defid2defembed
 
 
-class RecordExample(object):
+class SquadExample(object):
     """
-    A single training/test example for the Record dataset, as loaded from disk.
+    A single training/test example for the squad dataset, as loaded from disk.
 
     Args:
         qas_id: The example's unique identifier
@@ -92,15 +93,19 @@ class RecordExample(object):
             self,
             qas_id,
             question_text,
+            question_entities_strset,
             doc_text,
             answer_entities,
             passage_entities,
+            is_impossible=False,
     ):
         self.qas_id = qas_id
         self.question_text = question_text
+        self.question_entities_strset = question_entities_strset
         self.doc_text = doc_text
         self.answer_entities = answer_entities
         self.passage_entities = passage_entities
+        self.is_impossible = is_impossible
 
     def __repr__(self):
         s = ""
@@ -115,7 +120,7 @@ class RecordExample(object):
         return self.__repr__()
 
 
-class RecordExampleTokenized(object):
+class SquadExampleTokenized(object):
     def __init__(self,
                  id,
                  query_text,
@@ -175,13 +180,13 @@ class RecordExampleTokenized(object):
         return s
 
 
-class RecordProcessor(DataProcessor):
+class SquadProcessor(DataProcessor):
     """
-    Processor for the ReCoRD data set.
+    Processor for the squad data set.
     """
 
     def __init__(self, args):
-        self.name = "record"
+        self.name = "squad"
         self.do_lower_case = args.do_lower_case
         self.doc_stride = args.doc_stride
         self.use_kgs = args.use_kgs
@@ -228,23 +233,7 @@ class RecordProcessor(DataProcessor):
         filename = os.path.join(data_dir, filename)
         return self._create_examples(filename, "dev")
 
-    def get_test_examples(self, data_dir, filename=None):
-        """
-        Returns the evaluation example from the data directory.
-
-        Args:
-            data_dir: Directory containing the data files used for training and evaluating.
-            filename: None by default, specify this if the evaluation file has a different name than the original one
-                which is `train-v1.1.json` and `train-v2.0.json` for squad versions 1.1 and 2.0 respectively.
-        """
-        if data_dir is None:
-            data_dir = ""
-
-        logger.info("****** Get test examples ******")
-        filename = os.path.join(data_dir, filename)
-        return self._create_examples(filename, "test")
-
-    def convert_example_to_features(self, example, tokenizer, retrievers, is_training, is_testing):
+    def convert_example_to_features(self, example, tokenizer, retrievers, is_training):
         """
         :param example:
         :param args:
@@ -328,12 +317,11 @@ class RecordProcessor(DataProcessor):
         former_len = len(former_tokens)
         max_tokens_for_doc = self.max_seq_length - former_len - 1
 
-        if not is_testing:
-            # get all the answers and their positions
-            answer_spans = []  # item: tuple (answer_start, answer_end)
-            for answer_entity in example.answer_entities:
-                answer_spans.append((answer_entity[1], answer_entity[2]))
-            answer_spans = sorted(answer_spans, key=lambda t: t[0])
+        # get all the answers and their positions
+        answer_spans = []  # item: tuple (answer_start, answer_end)
+        for answer_entity in example.answer_entities:
+            answer_spans.append((answer_entity[1], answer_entity[2]))
+        answer_spans = sorted(answer_spans, key=lambda t: t[0])
 
         doc_spans = get_doc_spans(len(example.doc_tokens), max_tokens_for_doc, self.doc_stride)
 
@@ -416,7 +404,7 @@ class RecordProcessor(DataProcessor):
                     #     conceptids2synset.append([k, "good"])
                 kgs_conceptids2synset[kg] = conceptids2synset
 
-            feature = RecordFeature(
+            feature = SquadFeature(
                 qas_id=example.id,
                 example_index=0,
                 unique_id=0,
@@ -449,7 +437,7 @@ class RecordProcessor(DataProcessor):
             results = []
             logger.info("testing convert_example_to_features function")
             for example in tqdm(examples):
-                result = self.convert_example_to_features(example, tokenizer, retrievers, is_training, args.test)
+                result = self.convert_example_to_features(example, tokenizer, retrievers, is_training)
                 results.append(result)
 
         else:
@@ -461,13 +449,12 @@ class RecordProcessor(DataProcessor):
                     tokenizer=tokenizer,
                     is_training=is_training,
                     retrievers=retrievers,
-                    is_testing=args.test
                 )
                 results = list(
                     tqdm(
                         p.imap(annotate_, examples, chunksize=args.chunksize),
                         total=len(examples),
-                        desc="convert record examples to features",
+                        desc="convert squad examples to features",
                         disable=not tqdm_enabled,
                     )
                 )
@@ -535,20 +522,20 @@ class RecordProcessor(DataProcessor):
         if debug:
             for feature in features:
                 self.pad_and_index_features(feature, retrievers)
-        else:
-            with Pool(threads) as p:
-                annotate_ = partial(
-                    self.pad_and_index_features,
-                    retrievers=retrievers,
+
+        with Pool(threads) as p:
+            annotate_ = partial(
+                self.pad_and_index_features,
+                retrievers=retrievers,
+            )
+            padded_features = list(
+                tqdm(
+                    p.imap(annotate_, features, chunksize=args.chunksize),
+                    total=len(features),
+                    desc="pad features",
+                    disable=not tqdm_enabled,
                 )
-                padded_features = list(
-                    tqdm(
-                        p.imap(annotate_, features, chunksize=args.chunksize),
-                        total=len(features),
-                        desc="pad features",
-                        disable=not tqdm_enabled,
-                    )
-                )
+            )
 
         new_features = []
         unique_id = 1000000000
@@ -573,11 +560,11 @@ class RecordProcessor(DataProcessor):
                                                        debug=args.debug)
         return features, dataset, all_kgs_graphs
 
-    def tokenization_on_example(self, example, tokenizer, is_testing):
+    def tokenization_on_example(self, example, tokenizer):
         if isinstance(tokenizer, RobertaTokenizer):
-            return self.tokenization_on_example_roberta(example, tokenizer, is_testing=is_testing)
+            return self.tokenization_on_example_roberta(example, tokenizer)
         elif isinstance(tokenizer, BertTokenizer):
-            return self.tokenization_on_example_bert(example, tokenizer, is_testing=is_testing)
+            return self.tokenization_on_example_bert(example, tokenizer)
         else:
             raise NotImplementedError
 
@@ -664,7 +651,7 @@ class RecordProcessor(DataProcessor):
             to_check = False
         return text_from_sub, ori_to_sub_map, sub_to_ori_map
 
-    def tokenization_on_example_bert(self, example, tokenizer, is_testing):
+    def tokenization_on_example_bert(self, example, tokenizer):
         # do tokenization on raw question text
         query_text, query_subtokens, query_char_to_sub_map, query_sub_to_char_map = self.bert_from_string_to_subtokens(
             example.question_text, tokenizer)
@@ -698,40 +685,55 @@ class RecordProcessor(DataProcessor):
                                                                               entity['orig_text'])
             document_entities.append(
                 (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
-        if is_testing:
-            answer_entities = None
-        else:
-            answer_entities = []
-            for entity in example.answer_entities:
-                entity_start_position = doc_char_to_sub_map[entity['start_position']]
-                cur_end_position = entity['end_position']
-                entity_end_position = doc_char_to_sub_map[cur_end_position]
+        answer_entities = []
+        for entity in example.answer_entities:
+            entity_start_position = doc_char_to_sub_map[entity['start_position']]
+            cur_end_position = entity['end_position']
+            entity_end_position = doc_char_to_sub_map[cur_end_position]
 
-                stop_count = 0
-                while True:
-                    if stop_count > 100:
-                        logger.warning(
-                            "Somethging wrong in finding the entity span in answer span of {}!".format(example.qas_id))
-                        break
-                    stop_count += 1
-                    cur_end_position += 1
-                    if cur_end_position >= len(doc_char_to_sub_map):
-                        entity_end_position = len(doc_subtokens) - 1
-                        break
-                    if doc_char_to_sub_map[cur_end_position] != entity_end_position:
-                        entity_end_position = doc_char_to_sub_map[cur_end_position] - 1
-                        break
+            stop_count = 0
+            while True:
+                if stop_count > 100:
+                    logger.warning(
+                        "Somethging wrong in finding the entity span in answer span of {}!".format(example.qas_id))
+                    break
+                stop_count += 1
+                cur_end_position += 1
+                if cur_end_position >= len(doc_char_to_sub_map):
+                    entity_end_position = len(doc_subtokens) - 1
+                    break
+                if doc_char_to_sub_map[cur_end_position] != entity_end_position:
+                    entity_end_position = doc_char_to_sub_map[cur_end_position] - 1
+                    break
 
-                entity_start_position, entity_end_position = _improve_answer_span(doc_subtokens, entity_start_position,
-                                                                                  entity_end_position, tokenizer,
-                                                                                  entity['orig_text'])
+            entity_start_position, entity_end_position = _improve_answer_span(doc_subtokens, entity_start_position,
+                                                                              entity_end_position, tokenizer,
+                                                                              entity['orig_text'], is_answer=True)
 
-                answer_entities.append(
-                    (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
+            answer_entities.append(
+                (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
+        
+
+        ## select entity strings
+        entity_strings = set()
+        query_entity_str_list = example.question_entities_strset
+        for item in query_entity_str_list:
+            clean_text = ""
+            for c in item:
+                if is_whitespace(c):
+                    clean_text += " "
+                else:
+                    clean_text += remove_special_punc(c)
+            entity_strings.add(clean_text)
+
+        for document_entity in document_entities:
+            entity_strings.add(document_entity[0])
+
+
         # match query to passage entities
         query_entities = match_query_entities(query_text, document_entities, query_char_to_sub_map, query_subtokens,
-                                              tokenizer)  # [('trump', 10, 10)]
-        tokenized_example = RecordExampleTokenized(id=example.qas_id,
+                                              tokenizer, entity_strings)  # [('trump', 10, 10)]
+        tokenized_example = SquadExampleTokenized(id=example.qas_id,
                                                    query_text=query_text,
                                                    query_tokens=query_subtokens,
                                                    query_ori_to_tok_map=query_char_to_sub_map,
@@ -747,7 +749,7 @@ class RecordProcessor(DataProcessor):
 
         return tokenized_example
 
-    def tokenization_on_example_roberta(self, example, tokenizer, is_testing):
+    def tokenization_on_example_roberta(self, example, tokenizer):
         # build the mapping relation among the subtoken index and token index and char index
 
         # for query subtokens.
@@ -776,21 +778,33 @@ class RecordProcessor(DataProcessor):
             document_entities.append(
                 (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
 
-        if is_testing:
-            answer_entities = None
-        else:
-            answer_entities = []
-            for entity in example.answer_entities:
-                entity_start_position = doc_ori_to_sub_map[entity['start_position']]
-                entity_end_position = doc_ori_to_sub_map[entity['end_position']]
-                answer_entities.append(
-                    (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
+        answer_entities = []
+        for entity in example.answer_entities:
+            entity_start_position = doc_ori_to_sub_map[entity['start_position']]
+            entity_end_position = doc_ori_to_sub_map[entity['end_position']]
+            answer_entities.append(
+                (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
 
-        # match query to passage entities
+        ## select entity strings
+        entity_strings = set()
+        query_entity_str_list = example.question_entities_strset
+        for item in query_entity_str_list:
+            clean_text = ""
+            for c in item:
+                if is_whitespace(c):
+                    clean_text += " "
+                else:
+                    clean_text += remove_special_punc(c)
+            entity_strings.add(clean_text)
+
+        for document_entity in document_entities:
+            entity_strings.add(document_entity[0])
+
+            # match query to passage entities
         query_entities = match_query_entities(query_text_from_sub, document_entities,
-                                              query_ori_to_sub_map, query_subtokens, tokenizer)  # [('trump', 10, 10)]
+                                              query_ori_to_sub_map, query_subtokens, tokenizer, entity_strings)  # [('trump', 10, 10)]
 
-        tokenized_example = RecordExampleTokenized(id=example.qas_id,
+        tokenized_example = SquadExampleTokenized(id=example.qas_id,
                                                    query_text=query_text_from_sub,
                                                    query_tokens=query_subtokens,
                                                    query_ori_to_tok_map=query_ori_to_sub_map,
@@ -806,111 +820,185 @@ class RecordProcessor(DataProcessor):
 
         return tokenized_example
 
-    def tokenization_on_examples(self, examples, tokenizer, is_testing):
+    def tokenization_on_examples(self, examples, tokenizer):
         tokenization_result = []
         for example in tqdm(examples, desc='Tokenization on examples'):
-            tokenization_result.append(self.tokenization_on_example(example, tokenizer, is_testing=is_testing))
+            tokenization_result.append(self.tokenization_on_example(example, tokenizer))
         return tokenization_result
 
     def _create_examples(self, input_file, set_type):
         with open(input_file, "r") as reader:
             logger.info("Reading examples from {}".format(input_file))
-            if set_type == "test":
-                data_lines = reader.readlines()
-                input_data = [json.loads(line) for line in data_lines]
-            else:
-                input_data = json.load(reader)["data"]
+            input_data = json.load(reader)["data"]
         if self.fewer_label:
             logger.info("using fewer label, label rate:{}".format(self.label_rate))
             input_data = input_data[:int(len(input_data) * self.label_rate)]
 
-        def is_whitespace(c):
-            if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
-                return True
-            cat = unicodedata.category(c)
-            if cat == "Zs":
-                return True
-            return False
-
-        def remove_special_punc(c):
-            if c == "‘":
-                return "\'"
-            if c == "’":
-                return "\'"
-            if c == "“":
-                return "\""
-            if c == "”":
-                return "\""
-            return c
+        # def is_whitespace(c):
+        #     if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
+        #         return True
+        #     cat = unicodedata.category(c)
+        #     if cat == "Zs":
+        #         return True
+        #     return False
+        # 
+        # def remove_special_punc(c):
+        #     if c == "‘":
+        #         return "\'"
+        #     if c == "’":
+        #         return "\'"
+        #     if c == "“":
+        #         return "\""
+        #     if c == "”":
+        #         return "\""
+        #     return c
 
         examples = []
         for entry in tqdm(input_data, desc='Reading entries from json'):
-            paragraph_text = entry["passage"]["text"].replace('\xa0', ' ')
-            doc_text = ""
-            for c in paragraph_text:
-                if is_whitespace(c):
-                    doc_text += " "
-                else:
-                    doc_text += remove_special_punc(c)
+            for paragraph in entry["paragraphs"]:
+                paragraph_text = paragraph["context"].strip()
 
-            passage_entities = []
-            for entity in entry['passage']['entities']:
-                entity_start_offset = entity['start']
-                entity_end_offset = entity['end']
-                if entity_end_offset < entity_start_offset:  # some error labeled entities in record dataset
-                    continue
-                entity_text = doc_text[entity_start_offset: entity_end_offset + 1]
-                passage_entities.append({'orig_text': entity_text,
-                                         'start_position': entity_start_offset,
-                                         'end_position': entity_end_offset})
+                doc_text = ""
+                for c in paragraph_text:
+                    if is_whitespace(c):
+                        doc_text += " "
+                    else:
+                        doc_text += c
 
-            for qa in entry["qas"]:
-                if set_type == "test":
-                    qas_id = qa["idx"]
-                    question_text = qa["query"].replace('\xa0', ' ')
-                    example = RecordExample(
-                        qas_id=qas_id,
-                        question_text=question_text,
-                        doc_text=doc_text,
-                        answer_entities=None,
-                        passage_entities=passage_entities,
-                    )
-                    examples.append(example)
-                    continue
-
-                qas_id = qa["id"]
-                question_text = qa["query"].replace('\xa0', ' ')
-                answers = qa["answers"]
-                answer_entities = []
-
-                for entity in answers:
+                # doc_text = paragraph_text
+                # load entities in passage
+                passage_entities = []
+                for entity in paragraph['context_entities']:
                     entity_start_offset = entity['start']
                     entity_end_offset = entity['end']
-                    if entity_end_offset < entity_start_offset:  # some error labeled entities in record dataset
-                        continue
+                    og_entity_text = doc_text[entity_start_offset: entity_end_offset + 1]
+
+                    # entity_text = entity['text']
 
                     entity_text = ""
-                    for c in entity['text']:
-                        entity_text += remove_special_punc(c)
 
-                    entity_doc_text = doc_text[entity_start_offset: entity_end_offset + 1]
-                    if entity_doc_text != entity_text:
-                        logger.warning("answer text: {} differs from the positions {} in doc_text".format(entity_text,
-                                                                                                          entity_doc_text))
-                        continue
-                    else:
+                    for c in entity['text']:
+                        if is_whitespace(c):
+                            entity_text += " "
+                        else:
+                            entity_text += c
+
+                    # for c in entity['text']:
+                    #     if is_whitespace(c):
+                    #         entity_text += " "
+                    #     else:
+                    #         entity_text += remove_special_punc(c)
+
+                    if entity_text != og_entity_text:
+                        entity_start_offset, entity_end_offset, entity_text = renew_offset(entity_start_offset, entity_end_offset, entity_text, doc_text)
+                        if entity_end_offset is None:
+                            logger.warning("doc text: {} differs from the positions {} in doc_text".format(entity_text,
+                                                                                                              og_entity_text))
+                            continue
+                        # assert entity_text == entity['text']
+                    passage_entities.append({'orig_text': entity_text,
+                                             'start_position': entity_start_offset,
+                                             'end_position': entity_end_offset})
+
+
+
+                for qa in paragraph["qas"]:
+                    qas_id = qa["id"]
+                    # question_text = qa["question"]
+                    question_text = ""
+
+                    for c in qa["question"].strip():
+                        if is_whitespace(c):
+                            question_text += " "
+                        else:
+                            question_text += c
+
+                    question_entities_strset = set([entity_info["text"] for entity_info in qa["question_entities"]])
+                    answers = qa["answers"]
+                    answer_entities = []
+
+                    if (len(qa["answers"]) == 0):
+                        logger.warning("paragraph: {} \n q: {}".format(paragraph, qa))
+                        raise ValueError(
+                            "For training, each question should have exactly 1 answer."
+                        )
+
+                    for entity in answers:
+                        orig_answer_text = entity["text"]
+                        answer_length = len(orig_answer_text)
+                        entity_start_offset = entity['answer_start']
+                        entity_end_offset =  entity_start_offset + answer_length - 1
+                        if entity_end_offset < entity_start_offset:  # some error labeled entities in squad dataset
+                            continue
+
+                        # entity_text = entity['text']
+                        entity_text = ""
+                        for c in entity['text']:
+                            if is_whitespace(c):
+                                entity_text += " "
+                            else:
+                                entity_text += c
+
+                        entity_doc_text = doc_text[entity_start_offset: entity_end_offset + 1]
+                        if entity_doc_text != entity_text:
+                            entity_start_offset, entity_end_offset, entity_text = renew_offset(entity_start_offset,
+                                                                                               entity_end_offset,
+                                                                                               entity_text,
+                                                                                               doc_text)
+                            logger.info("renew: from {} to {}".format(entity_doc_text, entity_text))
+
+                            if entity_end_offset is None:
+                                logger.warning("answer text: {} differs from the positions {} in doc_text".format(entity_text,
+                                                                                                              entity_doc_text))
+                                continue
+
                         answer_entities.append({'orig_text': entity_text,
                                                 'start_position': entity_start_offset,
                                                 'end_position': entity_end_offset})
 
-                example = RecordExample(
-                    qas_id=qas_id,
-                    question_text=question_text,
-                    doc_text=doc_text,
-                    answer_entities=answer_entities,
-                    passage_entities=passage_entities,
-                )
-                examples.append(example)
+
+                    # orig_answer_text = entity["text"]
+                    # answer_length = len(orig_answer_text)
+                    # entity_start_offset = entity['answer_start']
+                    # entity_end_offset =  entity_start_offset + answer_length - 1
+                    # if entity_end_offset < entity_start_offset:  # some error labeled entities in squad dataset
+                    #     continue
+
+                    # entity_text = ""
+                    # for c in entity['text']:
+                    #     if is_whitespace(c):
+                    #         entity_text += " "
+                    #     else:
+                    #         entity_text += remove_special_punc(c)
+                    #
+                    # entity_doc_text = doc_text[entity_start_offset: entity_end_offset + 1]
+                    # if entity_doc_text != entity_text:
+                    #     entity_start_offset, entity_end_offset, entity_text = renew_offset(entity_start_offset,
+                    #                                                                        entity_end_offset,
+                    #                                                                        entity_text,
+                    #                                                                        doc_text)
+                    #     logger.info("renew: {}".format(entity_text))
+                    #
+                    #     if entity_end_offset is None:
+                    #         logger.warning("answer text: {} differs from the positions {} in doc_text".format(entity_text,
+                    #                                                                                       entity_doc_text))
+                    #         continue
+
+                    # answer_entities.append({'orig_text': orig_answer_text,
+                    #                         'start_position': entity_start_offset,
+                    #                         'end_position': entity_end_offset})
+
+                    example = SquadExample(
+                        qas_id=qas_id,
+                        question_text=question_text,
+                        question_entities_strset=question_entities_strset,
+                        doc_text=doc_text,
+                        answer_entities=answer_entities,
+                        passage_entities=passage_entities,
+                    )
+                    examples.append(example)
+        # global remove_special_punc_count
+        # logger.info(remove_special_punc_count)
         return examples
 
     @classmethod
@@ -922,35 +1010,25 @@ class RecordProcessor(DataProcessor):
             n_best_size,
             max_answer_length,
             output_prediction_file,
-            output_result,
+            output_nbest_file,
             verbose_logging,
             predict_file,
-            tokenizer,
-            is_testing,
-            att_score=None,
+            tokenizer
     ):
         """read in the dev.json file"""
         logger.info(" Find {}-best prediction for each qas-id.".format(n_best_size))
         with open(predict_file, "r", encoding='utf-8') as reader:
-            if not is_testing:
-                predict_json = json.load(reader)["data"]
-            else:
-                data_lines = reader.readlines()
-                predict_json = [json.loads(line) for line in data_lines]
-
-            all_candidates = {}
-            for passage in predict_json:
-                passage_text = passage['passage']['text']
-                candidates = []
-                for entity_info in passage['passage']['entities']:
-                    start_offset = entity_info['start']
-                    end_offset = entity_info['end']
-                    candidates.append(passage_text[start_offset: end_offset + 1])
-                for qa in passage['qas']:
-                    if not is_testing:
-                        all_candidates[qa['id']] = candidates
-                    else:
-                        all_candidates[qa['idx']] = candidates
+            predict_json = json.load(reader)["data"]
+            # all_candidates = {}
+            # for passage in predict_json:
+            #     passage_text = passage['passage']['text']
+            #     candidates = []
+            #     for entity_info in passage['passage']['entities']:
+            #         start_offset = entity_info['start']
+            #         end_offset = entity_info['end']
+            #         candidates.append(passage_text[start_offset: end_offset + 1])
+            #     for qa in passage['qas']:
+            #         all_candidates[qa['id']] = candidates
 
         example_index_to_features = collections.defaultdict(list)
         for feature in all_features:
@@ -996,19 +1074,20 @@ class RecordProcessor(DataProcessor):
                 output['end_index'] = entry.end_index
                 nbest_json.append(output)
 
-            best_pred = None
-            for pred in nbest_json:
-                if any([exact_match_score(pred['text'], candidate) > 0. for candidate in all_candidates[example.id]]):
-                    best_pred = pred
-                    break
-            if best_pred is None:
-                for pred in nbest_json:
-                    if any([f1_score(pred['text'], candidate) > 0. for candidate in
-                            all_candidates[example.id]]):
-                        best_pred = pred
-                        break
-            if best_pred is None:
-                best_pred = nbest_json[0]
+            # best_pred = None
+            # # for pred in nbest_json:
+            # #     if any([exact_match_score(pred['text'], candidate) > 0. for candidate in all_candidates[example.id]]):
+            # #         best_pred = pred
+            # #         break
+            # # if best_pred is None:
+            # #     for pred in nbest_json:
+            # #         if any([f1_score(pred['text'], candidate) > 0. for candidate in
+            # #                 all_candidates[example.id]]):
+            # #             best_pred = pred
+            # #             break
+            # if best_pred is None:
+            #     best_pred = nbest_json[0]
+            best_pred = nbest_json[0]
 
             all_predictions[example.id] = (best_pred['text'], best_pred['start_index'], best_pred['end_index'])
             all_nbest_json[example.id] = nbest_json
@@ -1018,17 +1097,16 @@ class RecordProcessor(DataProcessor):
             logger.info(f"Writing predictions to: {output_prediction_file}")
             with open(output_prediction_file, "w") as writer:
                 writer.write(json.dumps(all_predictions, indent=4) + "\n")
-        logger.info(f"Writing results to: {output_result}")
-        output_lines = [to_jsonl(elem_id, elem) for elem_id, elem in all_predictions.items()]
-        output_data_lines = "\n".join(output_lines)
-        with open(output_result, "w") as writer:
-            writer.write(output_data_lines)
-            writer.write("\n")
+
+        # if output_nbest_file:
+        #     logger.info(f"Writing nbest to: {output_nbest_file}")
+        #     with open(output_nbest_file, "w") as writer:
+        #         writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
 
         return all_predictions
 
     @classmethod
-    def record_evaluate(cls, examples, predictions, relate_path):
+    def squad_evaluate(cls, examples, predictions, relate_path="../data/"):
         evaluates = dict()
 
         f1 = exact_match = total = 0
@@ -1062,10 +1140,10 @@ class RecordProcessor(DataProcessor):
 
 
 def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
-                         orig_answer_text):
+                         orig_answer_text, is_answer=False):
     """Returns tokenized answer spans that better match the annotated answer."""
 
-    # The ReCoRD annotations are character based. We first project them to
+    # The squad annotations are character based. We first project them to
     # whitespace-tokenized words. But then after WordPiece tokenization, we can
     # often find a "better match". For example:
     #
@@ -1086,7 +1164,7 @@ def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
     # In this case, the annotator chose "Japan" as a character sub-span of
     # the word "Japanese". Since our WordPiece tokenizer does not split
     # "Japanese", we just use "Japanese" as the annotation. This is fairly rare
-    # in ReCoRD, but does happen.
+    # in squad, but does happen.
     tok_answer_text = " ".join(tokenizer.tokenize(orig_answer_text))
 
     for new_start in range(input_start, input_end + 1):
@@ -1094,11 +1172,12 @@ def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
             text_span = " ".join(doc_tokens[new_start:(new_end + 1)])
             if text_span == tok_answer_text:
                 return (new_start, new_end)
-
+    if is_answer:
+        logger.warning("no exact match answer entities")
     return (input_start, input_end)
 
 
-class RecordFeature(object):
+class SquadFeature(object):
     """A single set of features of data."""
 
     def __init__(self,
@@ -1134,7 +1213,7 @@ class RecordFeature(object):
         self.kgs_conceptids2synset = kgs_conceptids2synset
 
 
-class RecordResult(object):
+class SquadResult(object):
     """
     Constructs a SquadResult which can be used to evaluate a model's output on the SQuAD dataset.
 
@@ -1251,7 +1330,7 @@ def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_co
     return tokens, segment_ids, kgs_concept_ids
 
 
-def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tokenizer):
+def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tokenizer, entity_strings):
     """
     Find the index of entities in the query.
     :param text:
@@ -1261,9 +1340,9 @@ def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tok
     :return:
     """
 
-    entity_strings = set()
-    for document_entity in document_entities:
-        entity_strings.add(document_entity[0])  # .lower())
+    # entity_strings = set()
+    # for document_entity in document_entities:
+    #     entity_strings.add(document_entity[0])  # .lower())
 
     # text_lower = text.lower()
 
@@ -1362,16 +1441,13 @@ def create_tensordataset(features, is_training, args, retrievers, tokenizer, rel
         # get mapping relation between src to dst list each relation
         multi_relation_dict = retrive_multi_relation_dict(relation_list, wn18_dir)
         all_kgs_graphs = []
+        logger.info("testing graph_collecter function")
         for f in tqdm(features, desc="build dgl graph", disable=not tqdm_enabled, ):
-            for c_id, syn in f.kgs_conceptids2synset["wordnet"].items():
-                if c_id in retrievers["wordnet"].conceptids2synset:
-                    continue
-                retrievers["wordnet"].conceptids2synset[c_id] = syn
-
             g = graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer,
                                 multi_relation_dict, retrievers["wordnet"], encoder, defid2def, conceptid2defid,
                                 )
             all_kgs_graphs.append(g)
+
     else:
         all_kgs_graphs = None
 
@@ -1694,6 +1770,7 @@ def get_final_text(pred_text, orig_text, tokenizer, verbose=False):
         if verbose:
             logger.info("Couldn't map start position")
         return orig_text
+        # return pred_text.strip()
 
     orig_end_position = None
     if end_position in tok_s_to_ns_map:
@@ -1754,6 +1831,8 @@ def find_nbest_prediction_for_example(prelim_predictions, n_best_size, example, 
         pred_start_index = -1
         pred_end_index = -1
         if pred.start_index > -1:  # this is a non-null prediction
+            # ori_tok_start = feature.tokid_span_to_orig_map[pred.start_index]
+            # ori_tok_end = feature.tokid_span_to_orig_map[pred.end_index]
 
             pred_start_index = pred.start_index - feature.tokid_span_to_orig_map[0] + feature.tokid_span_to_orig_map[1]
             pred_end_index = pred.end_index - feature.tokid_span_to_orig_map[0] + feature.tokid_span_to_orig_map[1]
@@ -1762,20 +1841,30 @@ def find_nbest_prediction_for_example(prelim_predictions, n_best_size, example, 
             orig_doc_end = example.doc_tok_to_ori_map[pred_end_index]
             orig_doc_start, orig_doc_end = refine_char_start_end(orig_doc_start, orig_doc_end,
                                                                  example.doc_ori_to_tok_map)
+            # try:
             orig_text = example.doc_text[orig_doc_start: (orig_doc_end + 1)].strip()
-
+            # except:
+            #     orig_text = example.doc_text[orig_doc_start: orig_doc_end]
             tok_tokens = feature.tokens[pred.start_index: (pred.end_index + 1)]
             if isinstance(tokenizer, RobertaTokenizer):
                 tok_text = tokenizer.convert_tokens_to_string(tok_tokens).strip()
             elif isinstance(tokenizer, BertTokenizer):
+                # tok_text = " ".join(tok_tokens)
+                # tok_text = tok_text.replace(" ##", "")
+                # tok_text = tok_text.replace("##", "")
+                # tok_text = tok_text.strip()
+                # tok_text = " ".join(tok_text.split())
+
                 tok_text = tokenizer.convert_tokens_to_string(tok_tokens)
                 tok_text = tok_text.strip()
                 tok_text = " ".join(tok_text.split())
+
 
             final_text = get_final_text(tok_text, orig_text, tokenizer, verbose_logging)
             if final_text in seen_predictions:
                 continue
         else:
+            # orig_text = ""
             final_text = ""
             seen_predictions[""] = True
 
@@ -1875,5 +1964,41 @@ def check_concept_list(w):
                 print("wrong_type{}   {}".format(i, j))
                 print(w[i][j])
 
-def to_jsonl(elem_id, elem):
-    return json.dumps({"idx": elem_id, "label": elem[0]}).replace("\n", "")
+
+def is_whitespace(c):
+    if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
+        return True
+    cat = unicodedata.category(c)
+    if cat == "Zs":
+        return True
+    return False
+
+def remove_special_punc(c):
+    # global remove_special_punc_count
+    if c == "‘":
+        # logger.warning("remove_special_punc is triggered")
+        # remove_special_punc_count += 1
+        return "\'"
+    if c == "’":
+        # logger.warning("remove_special_punc is triggered")
+        # remove_special_punc_count += 1
+        return "\'"
+    if c == "“":
+        # logger.warning("remove_special_punc is triggered")
+        # remove_special_punc_count += 1
+        return "\""
+    if c == "”":
+        # logger.warning("remove_special_punc is triggered")
+        # remove_special_punc_count += 1
+        return "\""
+    return c
+
+def renew_offset(og_start, og_end, og_text, all_text):
+    for new_start in range(max(0, og_start-5), min(og_start+3, len(all_text))):
+        for new_end in range(max(0, og_end - 5), min(og_end + 3, len(all_text))):
+            if new_start > new_end:
+                continue
+            entity_text = all_text[new_start: new_end + 1]
+            if og_text == entity_text:
+                return new_start, new_end, entity_text
+    return None, None, og_text

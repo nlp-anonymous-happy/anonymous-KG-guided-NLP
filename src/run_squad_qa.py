@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+""" Finetuning the library models for question-answering on SQuAD (DistilBERT, Bert, XLM, XLNet)."""
 
 import argparse
 import glob
@@ -42,7 +43,7 @@ from transformers import (
 from model.model_utils import configure_tokenizer_model
 from kgs_retrieve.kg_utils import initialize_kg_retriever
 from utils.args import ArgumentGroup
-from text_processor.record import RecordResult, RecordProcessor, create_input, DefinitionInfo
+from text_processor.squad import SquadResult, SquadProcessor, create_input, DefinitionInfo
 from dgl import save_graphs, load_graphs
 
 import resource
@@ -84,7 +85,12 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    # train_sampler = SequentialSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+    # synset_graphs_batch = []
+    # for batch_index in train_dataloader.batch_sampler:
+    #     synset_graphs_batch.append([i for i in batch_index])
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -185,8 +191,10 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
     train_iterator = trange(
         epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
     )
+    # Added here for reproductibility
     set_seed(args)
     best_evals = dict()
+    # epoch_counts = 0
     all_train_size = args.per_gpu_train_batch_size * torch.distributed.get_world_size() * args.gradient_accumulation_steps
 
     if args.evaluate_epoch:
@@ -275,11 +283,19 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 if k not in logging_loss_dic:
                     logging_loss_dic[k] = 0.0
                 tr_loss_dic[k] += v.item()
+                if global_step >= args.warm_up and args.use_consistent_loss_wn and (
+                        step + 1) % args.gradient_accumulation_steps == 0:
+                    logger.info('{} during training {} at {}'.format(k, v.item(), global_step))
+                # if args.local_rank in [-1, 0] and (global_step == 1 or global_step == args.warm_up):
+                #     tb_writer.add_scalar(f'loss/{k}', v.item(), global_step)
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
 
                 if args.local_rank in [-1, 0] and global_step == 1:
                     tb_writer.add_scalar("loss", tr_loss, int(global_step * all_train_size / 24))
+                if args.local_rank in [-1, 0] and (global_step == 1 or global_step == args.warm_up):
+                    for k, v in tr_loss_dic.items():
+                        tb_writer.add_scalar(f'loss/{k}', v, int(global_step * all_train_size / 24))
 
                 if args.use_fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -297,7 +313,9 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                         and args.evaluate_during_training:
                     logger.info("Evaluation during training:")
                     logger.info("Loss during training is {}".format(loss.item()))
-
+                    # Only evaluate when single GPU otherwise metrics may not average well
+                    # if args.local_rank in [-1, 0] and args.evaluate_during_training:
+                    # try:
                     results = evaluate(args, model, processor, tokenizer, global_step, input_dir)
 
                     if args.local_rank in [-1, 0]:
@@ -326,7 +344,11 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
 
                                         # Take care of distributed/parallel training
                                         model_to_save = model.module if hasattr(model, "module") else model
-                                        model_to_save.save_pretrained(output_dir)
+                                        if args.model_type in ["bert", "kelm", "roberta", "roberta_base"]:
+                                            model_to_save.save_pretrained(output_dir)
+                                            # tokenizer.save_pretrained(output_dir)
+                                        else:
+                                            logger.warning("Have no idea how to save the model.")
 
                                         torch.save(args, os.path.join(output_dir, "training_args.bin"))
                                         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
@@ -352,7 +374,7 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                     for k, v in tr_loss_dic.items():
                         logging_loss_dic[k] = v
 
-                # if args.memory_bank_update and args.use_context_graph and global_step % args.memory_bank_update_steps == 0:
+                # if args.memory_bank_update and args.use_context_graph and args.speed_up_version == "v2" and global_step % args.memory_bank_update_steps == 0:
                 #     model.eval()
                 #     with torch.no_grad():
                 #         start_time = timeit.default_timer()
@@ -395,7 +417,7 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 #         logger.info("cuda: {} time for updating is {}".format(args.local_rank, timeit.default_timer() - start_time))
                 #         logger.info("cuda: {} update is done".format(args.local_rank))
 
-                # if args.memory_bank_update and global_step % args.memory_bank_update_steps == 0:
+                # if args.memory_bank_update and global_step % args.memory_bank_update_steps == 0 and args.speed_up_version == "v2":
                 #     with torch.no_grad():
                 #         start_time = timeit.default_timer()
                 #         logger.info("cuda: {} updating entity description text embedding by the latest encoder".format(
@@ -446,6 +468,40 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 epoch_iterator.close()
                 break
 
+        # if args.local_rank in [-1, 0]:
+        #     logger.info("To check layers' parameters.")
+        #     model_to_save = model.module if hasattr(model, "module") else model
+        #     if args.model_type == "kelm":
+        #         logger.info(model_to_save.text_embed_model.encoder.layer[0].output.dense.weight[:100, :100])
+        #     elif args.model_type == "bert":
+        #         logger.info(model_to_save.bert.encoder.layer[0].output.dense.weight[:100, :100])
+        #
+        #     if args.max_steps > 0 and global_step > args.max_steps:
+        #         train_iterator.close()
+        #         break
+        #
+        #     logger.info("Saving the model since an epoch ends")
+        #     try:
+        #         output_dir = os.path.join(args.output_dir,
+        #                                   "epoch-{}-checkpoint-{}".format(epochs_trained, global_step))
+        #         if not os.path.exists(output_dir):
+        #             os.mkdir(output_dir)
+        #
+        #         # Take care of distributed/parallel training
+        #         model_to_save = model.module if hasattr(model, "module") else model
+        #         if args.model_type in ["bert", "kelm", "roberta", "roberta_base"]:
+        #             model_to_save.save_pretrained(output_dir)
+        #             # tokenizer.save_pretrained(output_dir)
+        #         else:
+        #             logger.warning("Have no idea how to save the model.")
+        #
+        #         torch.save(args, os.path.join(output_dir, "training_args.bin"))
+        #         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+        #         torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+        #         logger.info("Saving arguments, optimizer and scheduler states to %s",
+        #                     output_dir)
+        #     except:
+        #         logger.warning("Cannot save the checkpoints.")
         epochs_trained += 1
     if args.local_rank in [-1, 0] and args.mark != "test":
         tb_writer.close()
@@ -523,14 +579,23 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
                 outputs = model(**inputs)
 
+            # if step == 0:
+            #     all_logits = torch.Tensor([o for o in outputs], device=args.device)
+            # else:
             all_start_logits = torch.cat((all_start_logits, outputs[0]), dim=0)
             all_end_logits = torch.cat((all_end_logits, outputs[1]), dim=0)
+            # all_logits = torch.cat((all_logits, torch.cat((outputs[0].unsqueeze(0), outputs[1].unsqueeze(0)), dim=0).unsqueeze(0)), dim=0)
 
             for i, feature_index in enumerate(feature_indices):
                 eval_feature = features[feature_index.item()]
                 unique_id = int(eval_feature.unique_id)
                 all_unique_ids.append(unique_id)
-
+                #
+                # output = [to_list(output[i]) for output in outputs]
+                # start_logits, end_logits = output
+                # result = RecordResult(unique_id, start_logits, end_logits)
+                #
+                # all_results.append(result)
         all_unique_ids = torch.tensor(all_unique_ids, dtype=torch.long, device=args.device)
 
         start_time = timeit.default_timer()
@@ -562,7 +627,7 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
                 for i, unique_id in enumerate(batch_unique_ids):
                     # output = [to_list(output[i]) for output in batch_logits]
                     start_logits, end_logits = to_list(batch_start_logits[i]), to_list(batch_end_logits[i])
-                    result = RecordResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
+                    result = SquadResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
 
                     all_results.append(result)
 
@@ -571,24 +636,23 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
             # Compute predictions
             output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-            output_result = os.path.join(args.output_dir, "results_{}.jsonl".format(prefix))
+            output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
 
-            predictions = RecordProcessor.compute_predictions_logits(
+            predictions = SquadProcessor.compute_predictions_logits(
                 examples_tokenized,
                 features,
                 all_results,
                 args.n_best_size,
                 args.max_answer_length,
                 output_prediction_file,
-                output_result,
+                output_nbest_file,
                 args.verbose_logging,
                 os.path.join(args.data_dir, args.predict_file),
-                tokenizer,
-                is_testing=args.test,
+                tokenizer
             )
 
             # Compute the F1 and exact scores.
-            results = RecordProcessor.record_evaluate(examples_tokenized, predictions, relate_path=args.output_dir)
+            results = SquadProcessor.squad_evaluate(examples_tokenized, predictions, args.data_dir)
             return results
         else:
             return None
@@ -628,8 +692,12 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
             features_and_dataset["dataset"],
             features_and_dataset["examples"],
         )
-
-        all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
+        if args.model_type in ["bert", "roberta", "roberta_base"]:
+            logger.info("not have to load graph data")
+            all_kgs_graphs, all_kgs_graphs_label_dict = None, {}
+        else:
+            all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
+            # defid2defembed = torch.load(os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_embedding")["defid2defembed"]
     else:
         logger.error("dataset not exist and program exits")
         exit()
@@ -674,22 +742,56 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             exit()
 
         logger.info("Creating features from dataset file at %s", input_dir)
+        if not os.path.exists(cached_features_file + "_example"):
+            examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
+            logger.info("saving example")
+            torch.save(examples, cached_features_file + "_example")
 
-        examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
+            # torch.save(examples, cached_features_file + "_example")
+        # else:
+        #     logger.info("Loading examples from cached files.")
+        #     examples = torch.load(cached_features_file + "_example")
 
-        examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
+        if not os.path.exists(cached_features_file + "_example_tokenized"):
+            examples_tokenized = processor.tokenization_on_examples(examples, tokenizer)
+            logger.info("saving examples_tokenized")
+            torch.save(examples_tokenized, cached_features_file + "_examples_tokenized")
+        #     torch.save(examples_tokenized, cached_features_file + "_example_tokenized")
+        # else:
+        #     logger.info("Loading tokenized examples from cached files.")
+        #     examples_tokenized = torch.load(cached_features_file + "_example_tokenized")
+        if not os.path.exists(cached_features_file + '_features_no_pad'):
+            features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers,
+                                                              not evaluate, debug=args.debug)
+            logger.info("saving features")
+            torch.save(features, cached_features_file + "_features")
+            # logger.info("saving repeated_id...")
+            # repeated_id_path = os.path.join(retrievers["wordnet"].filepath, "repeated_id_train.npy")
+            # np.save(repeated_id_path, retrievers["wordnet"].repeated_id)
+            # examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
+            # examples_tokenized = processor.tokenization_on_examples(examples, tokenizer)
+            # features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers, False, debug=args.debug)
+            # repeated_id_path = os.path.join(retrievers["wordnet"].filepath, "repeated_id.npy")
+            # np.save(repeated_id_path, retrievers["wordnet"].repeated_id)
+            # exit()
 
-        features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers,
-                                                          not evaluate, debug=args.debug)
+        #     torch.save(features, cached_features_file + '_features_no_pad')
+        # else:
+        #     logger.info("Loading no padded features from cached files.")
+        #     features = torch.load(cached_features_file + '_features_no_pad')
 
         features, dataset, all_kgs_graphs = processor.pad_and_index_features_all(
             features, retrievers, args, tokenizer, relation_list, encoder=encoder, definition_info=definition_info,
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
-            logger.info("complete data preprocessing")
+            # wn_synset_graphs = all_kgs_synset_graphs["wordnet"]
+            if args.model_type in ["bert", "roberta", "roberta_base"]:
+                all_kgs_graphs_label_dict = None
+            else:
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+                logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
 
@@ -735,19 +837,43 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             logger.info("Loading examples from cached files.")
             examples = torch.load(cached_features_file + "_example")
 
-        examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
-
-        features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers,
+        if not os.path.exists(cached_features_file + "_example_tokenized"):
+            examples_tokenized = processor.tokenization_on_examples(examples, tokenizer)
+        #     torch.save(examples_tokenized, cached_features_file + "_example_tokenized")
+        # else:
+        #     logger.info("Loading tokenized examples from cached files.")
+        #     examples_tokenized = torch.load(cached_features_file + "_example_tokenized")
+        if not os.path.exists(cached_features_file + '_features_no_pad'):
+            features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers,
                                                               not evaluate, debug=args.debug)
+
+            # logger.info("saving repeated_id...")
+            # repeated_id_path = os.path.join(retrievers["wordnet"].filepath, "repeated_id_train.npy")
+            # np.save(repeated_id_path, retrievers["wordnet"].repeated_id)
+            # examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
+            # examples_tokenized = processor.tokenization_on_examples(examples, tokenizer)
+            # features = processor.convert_examples_to_features(args, examples_tokenized, tokenizer, retrievers, False, debug=args.debug)
+            # repeated_id_path = os.path.join(retrievers["wordnet"].filepath, "repeated_id.npy")
+            # np.save(repeated_id_path, retrievers["wordnet"].repeated_id)
+            # exit()
+
+        #     torch.save(features, cached_features_file + '_features_no_pad')
+        # else:
+        #     logger.info("Loading no padded features from cached files.")
+        #     features = torch.load(cached_features_file + '_features_no_pad')
 
         features, dataset, all_kgs_graphs = processor.pad_and_index_features_all(
             features, retrievers, args, tokenizer, relation_list, encoder=encoder, definition_info=definition_info,
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
-            logger.info("complete data preprocessing")
+            # wn_synset_graphs = all_kgs_synset_graphs["wordnet"]
+            if args.model_type in ["bert", "roberta", "roberta_base"]:
+                all_kgs_graphs_label_dict = None
+            else:
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+                logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
 
@@ -755,43 +881,46 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
                 del f.kgs_conceptids2synset
             torch.save({"features": features, "dataset": dataset, "examples": examples_tokenized}, cached_features_file)
 
-            logger.info("saving definition embedding")
+            if args.model_type == "kelm":
+                logger.info("saving definition embedding")
 
-            t_list = tokenizer(definition_info.defid2def, return_tensors="pt", padding=True)
+                t_list = tokenizer(definition_info.defid2def, return_tensors="pt", padding=True)
 
-            t_list_input_ids = t_list["input_ids"].to(encoder.device)
-            if args.text_embed_model == "bert":
-                t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
-            t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
-
-            defid2defembed = torch.Tensor()
-            c_size = 1024
-            start_point = 0
-            end_point = start_point + c_size
-            total_size = len(t_list_input_ids)
-            while True:
-                if start_point > total_size:
-                    break
-                if end_point > total_size:
-                    end_point = total_size
-
+                t_list_input_ids = t_list["input_ids"].to(encoder.device)
                 if args.text_embed_model == "bert":
-                    tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                  token_type_ids=t_list_token_type_ids[start_point:end_point, :],
-                                  attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
-                elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
-                    tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                  attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
-                else:
-                    logger.warning("not available LM, exit program")
-                    exit()
-                defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
+                    t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
+                t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
 
-                start_point += c_size
-                end_point += c_size
+                defid2defembed = torch.Tensor()
+                c_size = 1024
+                start_point = 0
+                end_point = start_point + c_size
+                total_size = len(t_list_input_ids)
+                while True:
+                    if start_point > total_size:
+                        break
+                    if end_point > total_size:
+                        end_point = total_size
 
-            assert defid2defembed.shape[0] == total_size
+                    if args.text_embed_model == "bert":
+                        tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+                                      token_type_ids=t_list_token_type_ids[start_point:end_point, :],
+                                      attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
+                    elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
+                        tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+                                      attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
+                    else:
+                        logger.warning("not available LM, exit program")
+                        exit()
+                    defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
 
+                    start_point += c_size
+                    end_point += c_size
+
+                assert defid2defembed.shape[0] == total_size
+            else:
+                t_list = []
+                defid2defembed = []
 
             logger.info("Saving knowledge graph retrievers")
             for kg, retriever in retrievers.items():
@@ -821,10 +950,10 @@ def main():
 
     model_g = ArgumentGroup(parser, "model", "model configuration and path.")
 
-    model_g.add_arg("dataset", str, "record", "used dataset")
+    model_g.add_arg("dataset", str, "squad", "used dataset")
     model_g.add_arg("is_update_max_concept", bool, False, "weather update max concept for kg retriver")
     model_g.add_arg("full_table", bool, False, "full_table")
-    model_g.add_arg("test", bool, False, "weather load superglue test set")
+    model_g.add_arg("test", bool, False, "weather load test set")
     model_g.add_arg("use_wn", bool, True, "wn")
     model_g.add_arg("use_nell", bool, True, "nell")
 
@@ -871,7 +1000,8 @@ def main():
 
     model_g.add_arg("model_name_or_path", str, "../cache/bert-large-cased/",
                     "Path to pretrained model or model identifier from huggingface.co/models")
-    model_g.add_arg("config_name", str, "../cache/bert-large-cased/", "Pretrained config name or path if not the same as model_name")
+    model_g.add_arg("config_name", str, "../cache/bert-large-cased/",
+                    "Pretrained config name or path if not the same as model_name")
     model_g.add_arg("model_type", str, "kelm", "The classification model to be used.")
     model_g.add_arg("text_embed_model", str, "bert", "The model for embedding texts in kelm model.")
     model_g.add_arg("output_dir", str, "../outputs/test", "Path to save checkpoints.")
@@ -889,10 +1019,10 @@ def main():
     model_g.add_arg("gradient_accumulation_steps", int, 1,
                     "Number of updates steps to accumulate before performing a backward/update pass.")
     model_g.add_arg("num_train_epochs", float, 10, "Total number of training epochs to perform.")
-    model_g.add_arg("weight_decay", float, 0.01, "Weight decay if we apply some.")
+    model_g.add_arg("weight_decay", float, 0.0, "Weight decay if we apply some.")
     model_g.add_arg("learning_rate", float, 3e-4, "The initial learning rate for Adam.")
     model_g.add_arg("adam_epsilon", float, 1e-8, "Epsilon for Adam optimizer.")
-    model_g.add_arg("warmup_steps", int, 10, "Linear warmup over warmup_steps.")
+    model_g.add_arg("warmup_steps", int, 0, "Linear warmup over warmup_steps.")
     model_g.add_arg("max_grad_norm", float, 1.0, "Max gradient norm.")
     model_g.add_arg("evaluate_steps", int, 2, "Evaluate every X updates steps.")
     model_g.add_arg("evaluate_epoch", float, 0.0, "evaluate every X update epoch")
@@ -913,8 +1043,9 @@ def main():
     model_g.add_arg("cat_twotime_sub", bool, False, "The output part of vector in KELM")
 
     data_g = ArgumentGroup(parser, "data", "Data paths, vocab paths and data processing options")
-    data_g.add_arg("train_file", str, "record/train.json", "ReCoRD json for training. E.g., train.json.")
-    data_g.add_arg("predict_file", str, "record/dev.json", "ReCoRD json for predictions. E.g. dev.json.")
+    data_g.add_arg("train_file", str, "squad/train-v1.1.tagged.json", "SQUAD json for training. E.g., train.json.")
+    data_g.add_arg("predict_file", str, "squad/dev-v1.1.tagged.json", "SQUAD json for predictions. E.g. dev.json.")
+
     data_g.add_arg("cache_file_suffix", str, "test", "The suffix of cached file.")
     data_g.add_arg("cache_dir", str, "../cache/", "The cached data path.")
     data_g.add_arg("cache_store_dir", str, "../cache/", "The cached data path.")
@@ -961,7 +1092,7 @@ def main():
                        "Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     run_type_g.add_arg("min_diff_steps", int, 50, "The minimum saving steps before the last maximum steps.")
     args = parser.parse_args()
-
+    logger.info(args)
     logging.getLogger("transformers.modeling_utils").setLevel(logging.WARNING)  # Reduce model loading logs
 
     if not args.is_all_relation:
@@ -1041,7 +1172,7 @@ def main():
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-    processor = RecordProcessor(args)
+    processor = SquadProcessor(args)
 
     input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}".format(
         args.model_type,
@@ -1072,13 +1203,7 @@ def main():
         logger.info("data preprocess is done. program exits")
         exit()
 
-    if not args.full_table:
-        args.wn_def_embed_mat_dir = os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_embedding"
-    else:
-        logger.warning("set full_table False and program exits")
-        exit()
-    logger.info("used definition table: {}".format(args.wn_def_embed_mat_dir))
-
+    args.wn_def_embed_mat_dir = os.path.join(input_dir, args.cache_file_suffix) + "_" + "definition_embedding"
     # Training
     if args.do_train:
         retrievers = dict()

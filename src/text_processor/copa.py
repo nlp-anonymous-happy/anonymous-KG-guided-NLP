@@ -1,19 +1,3 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import torch
 import os
 import copy
@@ -55,6 +39,7 @@ _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
     "NbestPrediction", ["text", "start_logit", "end_logit", "start_index", "end_index"]
 )
 
+# remove_special_punc_count = 0
 
 class DefinitionInfo(object):
     def __init__(
@@ -68,9 +53,9 @@ class DefinitionInfo(object):
         # self.defid2defembed = defid2defembed
 
 
-class RecordExample(object):
+class CopaExample(object):
     """
-    A single training/test example for the Record dataset, as loaded from disk.
+    A single training/test example for the Copa dataset, as loaded from disk.
 
     Args:
         qas_id: The example's unique identifier
@@ -90,17 +75,21 @@ class RecordExample(object):
 
     def __init__(
             self,
-            qas_id,
-            question_text,
+            guid,
             doc_text,
-            answer_entities,
             passage_entities,
+            choice_text_list,
+            choice_entities_list,
+            label,
+            idx,
     ):
-        self.qas_id = qas_id
-        self.question_text = question_text
+        self.guid=guid,
         self.doc_text = doc_text
-        self.answer_entities = answer_entities
         self.passage_entities = passage_entities
+        self.choice_text_list = choice_text_list
+        self.choice_entities_list = choice_entities_list
+        self.label = label
+        self.idx = idx
 
     def __repr__(self):
         s = ""
@@ -115,21 +104,22 @@ class RecordExample(object):
         return self.__repr__()
 
 
-class RecordExampleTokenized(object):
+
+class CopaExampleTokenized(object):
     def __init__(self,
                  id,
-                 query_text,
-                 query_tokens,
-                 query_ori_to_tok_map,
-                 query_tok_to_ori_map,
-                 query_entities,
+                 guid,
+                 label_id,
+                 query_text_list,
+                 query_tokens_list,
+                 query_ori_to_tok_map_list,
+                 query_tok_to_ori_map_list,
                  doc_text,
                  doc_ori_text,
                  doc_tokens,
                  doc_tok_to_ori_map,
                  doc_ori_to_tok_map,
-                 doc_entities,
-                 answer_entities):
+                 ):
         """
         :param id: qas-id.
         :param query_text: the processed question string.
@@ -148,18 +138,17 @@ class RecordExampleTokenized(object):
         :param answer_entities:
         """
         self.id = id
-        self.query_text = query_text
-        self.query_tokens = query_tokens
-        self.query_ori_to_tok_map = query_ori_to_tok_map
-        self.query_tok_to_ori_map = query_tok_to_ori_map
-        self.query_entities = query_entities
+        self.guid = guid
+        self.label_id = label_id
+        self.query_text_list = query_text_list
+        self.query_tokens_list = query_tokens_list
+        self.query_ori_to_tok_map_list = query_ori_to_tok_map_list
+        self.query_tok_to_ori_map_list = query_tok_to_ori_map_list
         self.doc_text = doc_text
         self.doc_ori_text = doc_ori_text
         self.doc_tokens = doc_tokens
         self.doc_tok_to_ori_map = doc_tok_to_ori_map
         self.doc_ori_to_tok_map = doc_ori_to_tok_map
-        self.doc_entities = doc_entities
-        self.answer_entities = answer_entities
 
     def __str__(self):
         return self.__repr__()
@@ -174,18 +163,74 @@ class RecordExampleTokenized(object):
 
         return s
 
+class CopaExampleTokenized_choice(object):
+    def __init__(self,
+                 id,
+                 guid,
+                 label_id,
+                 query_text,
+                 query_tokens,
+                 query_ori_to_tok_map,
+                 query_tok_to_ori_map,
+                 doc_text,
+                 doc_ori_text,
+                 doc_tokens,
+                 doc_tok_to_ori_map,
+                 doc_ori_to_tok_map,
+                 ):
+        """
+        :param id: qas-id.
+        :param query_text: the processed question string.
+            e.g.
+        :param query_tokens: the basic units for embedding. If using Bert model, here means subtokens given by BertTokenizer.
+        :param query_ori_to_tok_map: the map from the index of char in the text to the index of subtoken in the query_tokens.
+            e.g.
+        :param query_tok_to_ori_map:
+        :param query_entities:
+        :param doc_text:
+        :param doc_ori_text:
+        :param doc_tokens:
+        :param doc_tok_to_ori_map:
+        :param doc_ori_to_tok_map:
+        :param doc_entities:
+        :param answer_entities:
+        """
+        self.id = id
+        self.guid = guid
+        self.label_id = label_id
+        self.query_text = query_text
+        self.query_tokens = query_tokens
+        self.query_ori_to_tok_map = query_ori_to_tok_map
+        self.query_tok_to_ori_map = query_tok_to_ori_map
+        self.doc_text = doc_text
+        self.doc_ori_text = doc_ori_text
+        self.doc_tokens = doc_tokens
+        self.doc_tok_to_ori_map = doc_tok_to_ori_map
+        self.doc_ori_to_tok_map = doc_ori_to_tok_map
 
-class RecordProcessor(DataProcessor):
-    """
-    Processor for the ReCoRD data set.
-    """
+    def __str__(self):
+        return self.__repr__()
 
+    def __repr__(self):
+        s = ""
+        s += "qas_id: %s" % (tokenization.printable_text(self.id))
+        s += ", question_text: %s" % (
+            tokenization.printable_text(self.query_text))
+        s += ", doc_text: [%s]" % (tokenization.printable_text(self.doc_ori_text))
+        s += ", answer entity: [%s]" % (" ".join(answer['orig_text'] for answer in self.answer_entities))
+
+        return s
+
+class CopaProcessor(DataProcessor):
+    """
+    Processor for the Copa data set.
+    """
     def __init__(self, args):
-        self.name = "record"
+        self.name = "copa"
         self.do_lower_case = args.do_lower_case
-        self.doc_stride = args.doc_stride
+        # self.doc_stride = args.doc_stride
         self.use_kgs = args.use_kgs
-        self.max_query_length = args.max_query_length
+        # self.max_query_length = args.max_query_length
         self.max_seq_length = args.max_seq_length
         self.no_stopwords = args.no_stopwords
         self.ignore_length = args.ignore_length
@@ -195,6 +240,10 @@ class RecordProcessor(DataProcessor):
         self.fewer_label = args.fewer_label
         self.label_rate = args.label_rate
         self.is_morphy = args.is_morphy
+        self.QUESTION_DICT = {
+            "cause": "What was the cause of this?",
+            "effect": "What happened as a result?",
+        }
 
     def get_train_examples(self, data_dir, filename=None):
         """
@@ -203,7 +252,6 @@ class RecordProcessor(DataProcessor):
         Args:
             data_dir: Directory containing the data files used for training and evaluating.
             filename: None by default, specify this if the training file has a different name than the original one
-                which is `train-v1.1.json` and `train-v2.0.json` for squad versions 1.1 and 2.0 respectively.
 
         """
         if data_dir is None:
@@ -219,7 +267,6 @@ class RecordProcessor(DataProcessor):
         Args:
             data_dir: Directory containing the data files used for training and evaluating.
             filename: None by default, specify this if the evaluation file has a different name than the original one
-                which is `train-v1.1.json` and `train-v2.0.json` for squad versions 1.1 and 2.0 respectively.
         """
         if data_dir is None:
             data_dir = ""
@@ -235,7 +282,6 @@ class RecordProcessor(DataProcessor):
         Args:
             data_dir: Directory containing the data files used for training and evaluating.
             filename: None by default, specify this if the evaluation file has a different name than the original one
-                which is `train-v1.1.json` and `train-v2.0.json` for squad versions 1.1 and 2.0 respectively.
         """
         if data_dir is None:
             data_dir = ""
@@ -263,88 +309,115 @@ class RecordProcessor(DataProcessor):
 
         if example is None:
             return features, max_retrieved
-        query_tokens = example.query_tokens
-        doc_tokens = example.doc_tokens
-        tok_len = len(query_tokens)
-        if tok_len > self.max_query_length:
-            query_tokens = query_tokens[:self.max_query_length]
 
-        # get the query and document tokens' corresponding concepts.
-        query_kgs_concepts = dict()
-        doc_kgs_concepts = dict()
-        kgs_query_conceptids2synset = dict()
-        kgs_doc_conceptids2synset = dict()
+        tokens_list = []
+        input_ids_list = []
+        input_mask_list = []
+        segment_ids_list = []
+        kgs_concept_ids_list = []
+        kgs_conceptids2synset_list = []
+        for num in range(2):
+            example_choice = CopaExampleTokenized_choice(id=example.id,
+                                                           guid=example.guid,
+                                                           label_id=example.label_id,
+                                                           query_text=example.query_text_list[num],
+                                                           query_tokens=example.query_tokens_list[num],
+                                                           query_ori_to_tok_map=example.query_ori_to_tok_map_list[num],
+                                                           query_tok_to_ori_map=example.query_tok_to_ori_map_list[num],
+                                                           doc_text=example.doc_text,
+                                                           doc_ori_text=example.doc_ori_text,
+                                                           doc_tokens=example.doc_tokens,
+                                                           doc_tok_to_ori_map=example.doc_tok_to_ori_map,
+                                                           doc_ori_to_tok_map=example.doc_ori_to_tok_map,
+                                                          )
 
-        for kg_info in self.use_kgs:
-            # extract tokens and their corresponding concept ids.
-            KGRetriever = retrievers[kg_info]
-            args_dict = dict()
-            args_dict['do_lower_case'] = self.do_lower_case
-            if kg_info == "wordnet":
-                args_dict['no_stopwords'] = self.no_stopwords
-                args_dict['ignore_length'] = self.ignore_length
-                args_dict['is_filter'] = self.is_filter
-                args_dict['is_lemma'] = self.is_lemma
-                args_dict['is_clean'] = self.is_clean
-                args_dict['is_morphy'] = self.is_morphy
+            query_tokens = example_choice.query_tokens
+            doc_tokens = example_choice.doc_tokens
+            max_doc_tok_len = self.max_seq_length - len(query_tokens) - 3
+            if max_doc_tok_len <= 0:
+                logger.warning("no doc tokens is available with current max length")
+            if len(doc_tokens) > max_doc_tok_len:
+                doc_tokens = doc_tokens[:max_doc_tok_len]
 
-                query_kg_concept_ids, doc_kg_concept_ids, max_concept_length, query_conceptids2synset, doc_conceptids2synset = \
-                    KGRetriever.lookup_concept_ids(example, tokenizer, **args_dict)
-                # to guarantee the length of tokens doesn't exceed the limitation.
-                if tok_len > self.max_query_length:
-                    query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
+            # get the query and document tokens' corresponding concepts.
+            query_kgs_concepts = dict()
+            doc_kgs_concepts = dict()
+            kgs_query_conceptids2synset = dict()
+            kgs_doc_conceptids2synset = dict()
 
-                kgs_query_conceptids2synset[kg_info] = query_conceptids2synset
-                kgs_doc_conceptids2synset[kg_info] = doc_conceptids2synset
+            for kg_info in self.use_kgs:
+                # extract tokens and their corresponding concept ids.
+                KGRetriever = retrievers[kg_info]
+                args_dict = dict()
+                args_dict['do_lower_case'] = self.do_lower_case
+                if kg_info == "wordnet":
+                    args_dict['no_stopwords'] = self.no_stopwords
+                    args_dict['ignore_length'] = self.ignore_length
+                    args_dict['is_filter'] = self.is_filter
+                    args_dict['is_lemma'] = self.is_lemma
+                    args_dict['is_clean'] = self.is_clean
+                    args_dict['is_morphy'] = self.is_morphy
 
-            else:
-                query_kg_concept_ids, doc_kg_concept_ids, max_concept_length = KGRetriever.lookup_concept_ids(example,
-                                                                                                              **args_dict)
+                    query_kg_concept_ids, doc_kg_concept_ids, max_concept_length, query_conceptids2synset, doc_conceptids2synset = \
+                        KGRetriever.lookup_concept_ids(example_choice, tokenizer, **args_dict)
+                    # to guarantee the length of tokens doesn't exceed the limitation.
+                    # if tok_len > self.max_query_length:
+                    #     query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
+                    if len(doc_kg_concept_ids) > max_doc_tok_len:
+                        doc_kg_concept_ids = doc_kg_concept_ids[:max_doc_tok_len]
 
-                # to guarantee the length of tokens doesn't exceed the limitation.
-                if tok_len > self.max_query_length:
-                    query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
-                kgs_query_conceptids2synset[kg_info] = []
-                kgs_doc_conceptids2synset[kg_info] = []
+                    kgs_query_conceptids2synset[kg_info] = query_conceptids2synset
+                    kgs_doc_conceptids2synset[kg_info] = doc_conceptids2synset
 
-            query_kgs_concepts[kg_info] = query_kg_concept_ids
-            doc_kgs_concepts[kg_info] = doc_kg_concept_ids
-            max_retrieved[kg_info] = max_concept_length
+                else:
+                    query_kg_concept_ids, doc_kg_concept_ids, max_concept_length = [], [], 0
 
-        # build the former part of tokens. Namely, add functional tokens in the query tokens..
-        former_tokens, former_segment_ids, former_kgs_concept_ids = build_first_part_features(
-            self.tokenizer_type,
-            self.use_kgs,
-            query_tokens,
-            query_kgs_concepts,
-            )
+                    # to guarantee the length of tokens doesn't exceed the limitation.
+                    # if tok_len > self.max_query_length:
+                    #     query_kg_concept_ids = query_kg_concept_ids[: self.max_query_length]
+                    if len(doc_kg_concept_ids) > max_doc_tok_len:
+                        doc_kg_concept_ids = doc_kg_concept_ids[:max_doc_tok_len]
+                    kgs_query_conceptids2synset[kg_info] = []
+                    kgs_doc_conceptids2synset[kg_info] = []
+
+                query_kgs_concepts[kg_info] = query_kg_concept_ids
+                doc_kgs_concepts[kg_info] = doc_kg_concept_ids
+                max_retrieved[kg_info] = max_concept_length
+
+            # build the former part of tokens. Namely, add functional tokens in the query tokens..
+            former_tokens, former_segment_ids, former_kgs_concept_ids = build_first_part_features(
+                self.tokenizer_type,
+                self.use_kgs,
+                query_tokens,
+                query_kgs_concepts,
+                )
 
 
-        # cut the long doc tokens into shorter spans. Distinguish the training mode and valiation mode.
-        # In the training mode, only keeps the doc_span including answer entities with the requirement that
-        # each span (1) only includes one answer and (2) the doc_span length is smaller than the max_length.
-        # In the validatiaon mode, just cut the document into several overlapped spans.
+            # cut the long doc tokens into shorter spans. Distinguish the training mode and valiation mode.
+            # In the training mode, only keeps the doc_span including answer entities with the requirement that
+            # each span (1) only includes one answer and (2) the doc_span length is smaller than the max_length.
+            # In the validatiaon mode, just cut the document into several overlapped spans.
 
-        former_len = len(former_tokens)
-        max_tokens_for_doc = self.max_seq_length - former_len - 1
+            former_len = len(former_tokens)
+            max_tokens_for_doc = self.max_seq_length - former_len - 1
 
-        if not is_testing:
-            # get all the answers and their positions
-            answer_spans = []  # item: tuple (answer_start, answer_end)
-            for answer_entity in example.answer_entities:
-                answer_spans.append((answer_entity[1], answer_entity[2]))
-            answer_spans = sorted(answer_spans, key=lambda t: t[0])
+            # if not is_testing:
+            #     # get all the answers and their positions
+            #     answer_spans = []  # item: tuple (answer_start, answer_end)
+            #     for answer_entity in example_choice.answer_entities:
+            #         answer_spans.append((answer_entity[1], answer_entity[2]))
+            #     answer_spans = sorted(answer_spans, key=lambda t: t[0])
+            #
+            # doc_spans = get_doc_spans(len(example_choice.doc_tokens), max_tokens_for_doc, self.doc_stride)
 
-        doc_spans = get_doc_spans(len(example.doc_tokens), max_tokens_for_doc, self.doc_stride)
-
-        for (doc_span_index, doc_span) in enumerate(doc_spans):
-            start_position, end_position = None, None
-            if is_training:
-                # For training, if our document chunk does not contain an annotation
-                # we throw it out, since there is nothing to predict.
-                start_position, end_position = get_answer_position(doc_span, answer_spans)
-                if start_position == -1:
-                    continue
+        # for (doc_span_index, doc_span) in enumerate(doc_spans):
+        #     start_position, end_position = None, None
+        #     if is_training:
+        #         # For training, if our document chunk does not contain an annotation
+        #         # we throw it out, since there is nothing to predict.
+        #         start_position, end_position = get_answer_position(doc_span, answer_spans)
+        #         if start_position == -1:
+        #             continue
 
             tokens = copy.deepcopy(former_tokens)
             segment_ids = copy.deepcopy(former_segment_ids)
@@ -354,10 +427,14 @@ class RecordProcessor(DataProcessor):
             # if (doc_span.start + doc_span.length) < len(doc_tokens):
             #     logger.warning("warning!  need to deal with graph data")
             #     exit()
-            tokens.extend(doc_tokens[doc_span.start: (doc_span.start + doc_span.length)])
-            segment_ids.extend([1] * doc_span.length)
+            assert len(doc_tokens) <= max_tokens_for_doc
+            tokens.extend(doc_tokens)
+            segment_ids.extend([1] * len(doc_tokens))
             for kg in self.use_kgs:
-                kgs_concept_ids[kg].extend(doc_kgs_concepts[kg][doc_span.start: (doc_span.start + doc_span.length)])
+                # kgs_concept_ids[kg].extend(doc_kgs_concepts[kg][doc_span.start: (doc_span.start + doc_span.length)])
+                assert len(doc_kgs_concepts[kg]) <= max_tokens_for_doc
+                kgs_concept_ids[kg].extend(doc_kgs_concepts[kg])
+
 
             if self.tokenizer_type == "roberta":
                 tokens.append("</s>")
@@ -371,9 +448,9 @@ class RecordProcessor(DataProcessor):
             # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.
             input_mask = [1] * len(input_ids)
 
-            if start_position is not None:
-                start_position = start_position - doc_span.start + tok_offset
-                end_position = end_position - doc_span.start + tok_offset
+            # if start_position is not None:
+            #     start_position = start_position - doc_span.start + tok_offset
+            #     end_position = end_position - doc_span.start + tok_offset
 
             kgs_conceptids2synset = {}
             for kg in self.use_kgs:
@@ -415,23 +492,31 @@ class RecordProcessor(DataProcessor):
                     # for k, v in query_conceptids2synset.items():
                     #     conceptids2synset.append([k, "good"])
                 kgs_conceptids2synset[kg] = conceptids2synset
+            kgs_concept_ids['nell'] = [[] for _ in range(len(kgs_concept_ids['wordnet']))]
+            assert len(tokens)==len(input_ids)==len(input_mask)==len(segment_ids)==len(kgs_concept_ids['wordnet'])==len(kgs_concept_ids['nell'])
 
-            feature = RecordFeature(
-                qas_id=example.id,
-                example_index=0,
-                unique_id=0,
-                tokens=tokens,
-                tokid_span_to_orig_map=(tok_offset, doc_span.start, doc_span.length),
-                input_ids=input_ids,
-                attention_mask=input_mask,
-                token_type_ids=segment_ids,
-                start_position=start_position,
-                end_position=end_position,
-                kgs_concept_ids=kgs_concept_ids,
-                kgs_conceptids2synset=kgs_conceptids2synset,
-            )
+            tokens_list.append(tokens)
+            input_ids_list.append(input_ids)
+            input_mask_list.append(input_mask)
+            segment_ids_list.append(segment_ids)
+            kgs_concept_ids_list.append(kgs_concept_ids)
+            kgs_conceptids2synset_list.append(kgs_conceptids2synset)
 
-            features.append(feature)
+        feature = CopaFeature(
+            guid=example.guid,
+            unique_id=example.id,
+            example_index=example.id,
+            label_id=example.label_id,
+            tokens_list=tokens_list,
+            # tokid_span_to_orig_map=(tok_offset, doc_span.start, doc_span.length),
+            input_ids_list=input_ids_list,
+            attention_mask_list=input_mask_list,
+            token_type_ids_list=segment_ids_list,
+            kgs_concept_ids_list=kgs_concept_ids_list,
+            kgs_conceptids2synset_list=kgs_conceptids2synset_list,
+        )
+
+        features.append(feature)
         return features, max_retrieved
 
     def convert_examples_to_features(self,
@@ -467,7 +552,7 @@ class RecordProcessor(DataProcessor):
                     tqdm(
                         p.imap(annotate_, examples, chunksize=args.chunksize),
                         total=len(examples),
-                        desc="convert record examples to features",
+                        desc="convert Copa examples to features",
                         disable=not tqdm_enabled,
                     )
                 )
@@ -490,35 +575,35 @@ class RecordProcessor(DataProcessor):
 
             # w = feature.kgs_concept_ids["wordnet"]
             # check_concept_list(w)
+            for num in range(2):
+                pad_len = self.max_seq_length - len(feature.input_ids_list[num])
+                feature.input_ids_list[num].extend([0] * pad_len)
+                feature.attention_mask_list[num].extend([0] * pad_len)
+                feature.token_type_ids_list[num].extend([0] * pad_len)
+                for kg in self.use_kgs:
+                    feature.kgs_concept_ids_list[num][kg].extend([[] for _ in range(pad_len)])
+                    if len(feature.kgs_concept_ids_list[num][kg]) != self.max_seq_length:
+                        logger.warning(
+                            "Feature qas-id: {} has {} different concepts length {} with max seq length {}".format(
+                                feature.qas_id, kg, len(feature.kgs_concept_ids_list[num][kg]), self.max_seq_length))
 
-            pad_len = self.max_seq_length - len(feature.input_ids)
-            feature.input_ids.extend([0] * pad_len)
-            feature.attention_mask.extend([0] * pad_len)
-            feature.token_type_ids.extend([0] * pad_len)
-            for kg in self.use_kgs:
-                feature.kgs_concept_ids[kg].extend([[] for _ in range(pad_len)])
-                if len(feature.kgs_concept_ids[kg]) != self.max_seq_length:
-                    logger.warning(
-                        "Feature qas-id: {} has {} different concepts length {} with max seq length {}".format(
-                            feature.qas_id, kg, len(feature.kgs_concept_ids[kg]), self.max_seq_length))
+                assert len(feature.input_ids_list[num]) == self.max_seq_length
+                assert len(feature.attention_mask_list[num]) == self.max_seq_length
+                assert len(feature.token_type_ids_list[num]) == self.max_seq_length
 
-            assert len(feature.input_ids) == self.max_seq_length
-            assert len(feature.attention_mask) == self.max_seq_length
-            assert len(feature.token_type_ids) == self.max_seq_length
+                # w = feature.kgs_concept_ids_list[num]["wordnet"]
+                # check_concept_list(w)
+                # pad kg concepts
+                for kg in self.use_kgs:
+                    concept_ids = feature.kgs_concept_ids_list[num][kg]
+                    kg_max_len = retrievers[kg].get_concept_max_length()
+                    for cindex in range(self.max_seq_length):
+                        expaned_concept_ids = concept_ids[cindex] + [0 for _ in range(
+                            kg_max_len - len(concept_ids[cindex]))]
+                        concept_ids[cindex] = expaned_concept_ids[:kg_max_len]
+                    assert all([len(id_list) == kg_max_len for id_list in concept_ids])
 
-            # w = feature.kgs_concept_ids["wordnet"]
-            # check_concept_list(w)
-            # pad kg concepts
-            for kg in self.use_kgs:
-                concept_ids = feature.kgs_concept_ids[kg]
-                kg_max_len = retrievers[kg].get_concept_max_length()
-                for cindex in range(self.max_seq_length):
-                    expaned_concept_ids = concept_ids[cindex] + [0 for _ in range(
-                        kg_max_len - len(concept_ids[cindex]))]
-                    concept_ids[cindex] = expaned_concept_ids[:kg_max_len]
-                assert all([len(id_list) == kg_max_len for id_list in concept_ids])
-
-                feature.kgs_concept_ids[kg] = concept_ids
+                    feature.kgs_concept_ids_list[num][kg] = concept_ids
 
             new_features.append(feature)
         return new_features
@@ -573,11 +658,11 @@ class RecordProcessor(DataProcessor):
                                                        debug=args.debug)
         return features, dataset, all_kgs_graphs
 
-    def tokenization_on_example(self, example, tokenizer, is_testing):
+    def tokenization_on_example(self, example, tokenizer, example_id):
         if isinstance(tokenizer, RobertaTokenizer):
-            return self.tokenization_on_example_roberta(example, tokenizer, is_testing=is_testing)
+            return self.tokenization_on_example_roberta(example, tokenizer)
         elif isinstance(tokenizer, BertTokenizer):
-            return self.tokenization_on_example_bert(example, tokenizer, is_testing=is_testing)
+            return self.tokenization_on_example_bert(example, tokenizer, example_id)
         else:
             raise NotImplementedError
 
@@ -607,7 +692,14 @@ class RecordProcessor(DataProcessor):
         char_to_unpunc_map = []
         unpunc_to_char_map = []
         unpunc_to_sub_map = []
+        # tmp_count = 0
+        # for ccc in cleaned_text:
+        #     if self.is_whitespace(ccc):
+        #         tmp_count += 1
+        #     else:
+        #         break
         char_to_sub_map = []
+        # char_to_sub_map.extend([-1] * tmp_count)
         sub_to_char_map = []
         prev_is_whitespace = True
 
@@ -636,7 +728,7 @@ class RecordProcessor(DataProcessor):
                 for sub_token in tokenizer.wordpiece_tokenizer.tokenize(token):
                     subtokens.append(sub_token)
                     sub_to_char_map.append(unpunc_to_char_map[unpunc_index])
-
+        assert len(char_to_sub_map) == len(char_to_unpunc_map)
         return cleaned_text, subtokens, char_to_sub_map, sub_to_char_map
 
     def roberta_from_string_to_subtokens(self, subtokens, tokenizer):
@@ -664,97 +756,43 @@ class RecordProcessor(DataProcessor):
             to_check = False
         return text_from_sub, ori_to_sub_map, sub_to_ori_map
 
-    def tokenization_on_example_bert(self, example, tokenizer, is_testing):
+    def tokenization_on_example_bert(self, example, tokenizer, example_id):
         # do tokenization on raw question text
-        query_text, query_subtokens, query_char_to_sub_map, query_sub_to_char_map = self.bert_from_string_to_subtokens(
-            example.question_text, tokenizer)
         doc_text, doc_subtokens, doc_char_to_sub_map, doc_sub_to_char_map = self.bert_from_string_to_subtokens(
             example.doc_text, tokenizer)
 
-        # generate token-level document entity index
-        document_entities = []
-        for entity in example.passage_entities:
-            entity_start_position = doc_char_to_sub_map[entity['start_position']]
-            cur_end_position = entity['end_position']
-            entity_end_position = doc_char_to_sub_map[cur_end_position]
+        query_text_list = []
+        query_tokens_list = []
+        query_ori_to_tok_map_list = []
+        query_tok_to_ori_map_list = []
+        for num in range(2):
+            choice_tag = "choice" + str(num + 1)
+            query_text, query_subtokens, query_char_to_sub_map, query_sub_to_char_map = self.bert_from_string_to_subtokens(
+                example.choice_text_list[num], tokenizer)
 
-            stop_count = 0
-            while True:
-                if stop_count > 100:
-                    logger.warning(
-                        "Somethging wrong in finding the entity span in document span of {}!".format(example.qas_id))
-                    break
-                stop_count += 1
-                cur_end_position += 1
-                if cur_end_position >= len(doc_char_to_sub_map):
-                    entity_end_position = len(doc_subtokens) - 1
-                    break
-                if doc_char_to_sub_map[cur_end_position] != entity_end_position:
-                    entity_end_position = doc_char_to_sub_map[cur_end_position] - 1
-                    break
+            query_text_list.append(query_text)
+            query_tokens_list.append(query_subtokens)
+            query_ori_to_tok_map_list.append(query_char_to_sub_map)
+            query_tok_to_ori_map_list.append(query_sub_to_char_map)
 
-            entity_start_position, entity_end_position = _improve_answer_span(doc_subtokens, entity_start_position,
-                                                                              entity_end_position, tokenizer,
-                                                                              entity['orig_text'])
-            document_entities.append(
-                (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
-        if is_testing:
-            answer_entities = None
-        else:
-            answer_entities = []
-            for entity in example.answer_entities:
-                entity_start_position = doc_char_to_sub_map[entity['start_position']]
-                cur_end_position = entity['end_position']
-                entity_end_position = doc_char_to_sub_map[cur_end_position]
-
-                stop_count = 0
-                while True:
-                    if stop_count > 100:
-                        logger.warning(
-                            "Somethging wrong in finding the entity span in answer span of {}!".format(example.qas_id))
-                        break
-                    stop_count += 1
-                    cur_end_position += 1
-                    if cur_end_position >= len(doc_char_to_sub_map):
-                        entity_end_position = len(doc_subtokens) - 1
-                        break
-                    if doc_char_to_sub_map[cur_end_position] != entity_end_position:
-                        entity_end_position = doc_char_to_sub_map[cur_end_position] - 1
-                        break
-
-                entity_start_position, entity_end_position = _improve_answer_span(doc_subtokens, entity_start_position,
-                                                                                  entity_end_position, tokenizer,
-                                                                                  entity['orig_text'])
-
-                answer_entities.append(
-                    (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
-        # match query to passage entities
-        query_entities = match_query_entities(query_text, document_entities, query_char_to_sub_map, query_subtokens,
-                                              tokenizer)  # [('trump', 10, 10)]
-        tokenized_example = RecordExampleTokenized(id=example.qas_id,
-                                                   query_text=query_text,
-                                                   query_tokens=query_subtokens,
-                                                   query_ori_to_tok_map=query_char_to_sub_map,
-                                                   query_tok_to_ori_map=query_sub_to_char_map,
-                                                   query_entities=query_entities,
+        tokenized_example = CopaExampleTokenized(id=example.idx,
+                                                   guid=example.guid,
+                                                   label_id = example.label,
+                                                   query_text_list=query_text_list,
+                                                   query_tokens_list=query_tokens_list,
+                                                   query_ori_to_tok_map_list=query_ori_to_tok_map_list,
+                                                   query_tok_to_ori_map_list=query_tok_to_ori_map_list,
                                                    doc_text=doc_text,
                                                    doc_ori_text=example.doc_text,
                                                    doc_tokens=doc_subtokens,
                                                    doc_tok_to_ori_map=doc_sub_to_char_map,
                                                    doc_ori_to_tok_map=doc_char_to_sub_map,
-                                                   doc_entities=document_entities,
-                                                   answer_entities=answer_entities)
+                                                  )
 
         return tokenized_example
 
-    def tokenization_on_example_roberta(self, example, tokenizer, is_testing):
+    def tokenization_on_example_roberta(self, example, tokenizer):
         # build the mapping relation among the subtoken index and token index and char index
-
-        # for query subtokens.
-        query_subtokens = tokenizer.tokenize(example.question_text)
-        query_text_from_sub, query_ori_to_sub_map, query_sub_to_ori_map = self.roberta_from_string_to_subtokens(
-            query_subtokens, tokenizer)
-
         # for doc subtokens
         doc_subtokens = tokenizer.tokenize(example.doc_text)
         doc_text, doc_ori_to_sub_map, doc_sub_to_ori_map = self.roberta_from_string_to_subtokens(doc_subtokens,
@@ -765,152 +803,185 @@ class RecordProcessor(DataProcessor):
             passage_entities = relocate_entities(example.passage_entities, doc_text)
             example.passage_entities = passage_entities
 
-        # return None
+        query_text_list = []
+        query_tokens_list = []
+        query_ori_to_tok_map_list = []
+        query_tok_to_ori_map_list = []
+        for num in range(2):
+            choice_tag = "choice" + str(num + 1)
+            query_subtokens = tokenizer.tokenize(example.choice_text_list[num])
 
-        document_entities = []
-        for entity in example.passage_entities:
-            if len(entity['orig_text']) < 2:
-                continue
-            entity_start_position = doc_ori_to_sub_map[entity['start_position']]
-            entity_end_position = doc_ori_to_sub_map[entity['end_position']]
-            document_entities.append(
-                (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
+            query_text_from_sub, query_ori_to_sub_map, query_sub_to_ori_map = self.roberta_from_string_to_subtokens(
+                query_subtokens, tokenizer)
 
-        if is_testing:
-            answer_entities = None
-        else:
-            answer_entities = []
-            for entity in example.answer_entities:
-                entity_start_position = doc_ori_to_sub_map[entity['start_position']]
-                entity_end_position = doc_ori_to_sub_map[entity['end_position']]
-                answer_entities.append(
-                    (entity['orig_text'], entity_start_position, entity_end_position))  # ('Trump', 10, 10)
+            query_text_list.append(query_text_from_sub)
+            query_tokens_list.append(query_subtokens)
+            query_ori_to_tok_map_list.append(query_ori_to_sub_map)
+            query_tok_to_ori_map_list.append(query_sub_to_ori_map)
 
-        # match query to passage entities
-        query_entities = match_query_entities(query_text_from_sub, document_entities,
-                                              query_ori_to_sub_map, query_subtokens, tokenizer)  # [('trump', 10, 10)]
-
-        tokenized_example = RecordExampleTokenized(id=example.qas_id,
-                                                   query_text=query_text_from_sub,
-                                                   query_tokens=query_subtokens,
-                                                   query_ori_to_tok_map=query_ori_to_sub_map,
-                                                   query_tok_to_ori_map=query_sub_to_ori_map,
-                                                   query_entities=query_entities,
+        tokenized_example = CopaExampleTokenized(id=example.idx,
+                                                   guid=example.guid,
+                                                   label_id = example.label,
+                                                   query_text_list=query_text_list,
+                                                   query_tokens_list=query_tokens_list,
+                                                   query_ori_to_tok_map_list=query_ori_to_tok_map_list,
+                                                   query_tok_to_ori_map_list=query_tok_to_ori_map_list,
                                                    doc_text=doc_text,
                                                    doc_ori_text=example.doc_text,
                                                    doc_tokens=doc_subtokens,
                                                    doc_tok_to_ori_map=doc_sub_to_ori_map,
                                                    doc_ori_to_tok_map=doc_ori_to_sub_map,
-                                                   doc_entities=document_entities,
-                                                   answer_entities=answer_entities)
-
+                                                  )
         return tokenized_example
 
     def tokenization_on_examples(self, examples, tokenizer, is_testing):
         tokenization_result = []
+        example_id = 0
         for example in tqdm(examples, desc='Tokenization on examples'):
-            tokenization_result.append(self.tokenization_on_example(example, tokenizer, is_testing=is_testing))
+            tokenization_result.append(self.tokenization_on_example(example, tokenizer, example_id))
+            example_id += 1
         return tokenization_result
 
     def _create_examples(self, input_file, set_type):
-        with open(input_file, "r") as reader:
-            logger.info("Reading examples from {}".format(input_file))
-            if set_type == "test":
-                data_lines = reader.readlines()
-                input_data = [json.loads(line) for line in data_lines]
-            else:
-                input_data = json.load(reader)["data"]
-        if self.fewer_label:
-            logger.info("using fewer label, label rate:{}".format(self.label_rate))
-            input_data = input_data[:int(len(input_data) * self.label_rate)]
+        input_data = read_json_lines(input_file)
+        # if self.fewer_label:
+        #     logger.info("using fewer label, label rate:{}".format(self.label_rate))
+        #     input_data = input_data[:int(len(input_data) * self.label_rate)]
 
-        def is_whitespace(c):
-            if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
-                return True
-            cat = unicodedata.category(c)
-            if cat == "Zs":
-                return True
-            return False
-
-        def remove_special_punc(c):
-            if c == "‘":
-                return "\'"
-            if c == "’":
-                return "\'"
-            if c == "“":
-                return "\""
-            if c == "”":
-                return "\""
-            return c
+        # def is_whitespace(c):
+        #     if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
+        #         return True
+        #     cat = unicodedata.category(c)
+        #     if cat == "Zs":
+        #         return True
+        #     return False
+        # 
+        # def remove_special_punc(c):
+        #     if c == "‘":
+        #         return "\'"
+        #     if c == "’":
+        #         return "\'"
+        #     if c == "“":
+        #         return "\""
+        #     if c == "”":
+        #         return "\""
+        #     return c
 
         examples = []
-        for entry in tqdm(input_data, desc='Reading entries from json'):
-            paragraph_text = entry["passage"]["text"].replace('\xa0', ' ')
+        for line in input_data:
+            paragraph = line
+            paragraph_text = paragraph["premise"].strip()
+            passage_id = line["idx"]
             doc_text = ""
             for c in paragraph_text:
                 if is_whitespace(c):
                     doc_text += " "
                 else:
-                    doc_text += remove_special_punc(c)
+                    doc_text += c
 
+            if len(doc_text) != len(paragraph["premise"]):
+                logger.warning("{} different length {}".format(paragraph["premise"], doc_text))
+
+            question = self.QUESTION_DICT[line["question"]]
+
+            doc_text += " "
+            for c in question:
+                if is_whitespace(c):
+                    doc_text += " "
+                else:
+                    doc_text += c
+            # doc_text = paragraph_text
+            # load entities in passage
             passage_entities = []
-            for entity in entry['passage']['entities']:
+            for entity in paragraph['context_entities']:
                 entity_start_offset = entity['start']
                 entity_end_offset = entity['end']
-                if entity_end_offset < entity_start_offset:  # some error labeled entities in record dataset
-                    continue
-                entity_text = doc_text[entity_start_offset: entity_end_offset + 1]
+                if entity_end_offset < entity_start_offset:  # some error labeled entities in Copa dataset
+                    logger.warning("weried entity position")
+                og_entity_text = doc_text[entity_start_offset: entity_end_offset + 1]
+
+                # entity_text = entity['text']
+
+                entity_text = ""
+
+                for c in entity['text']:
+                    if is_whitespace(c):
+                        entity_text += " "
+                    else:
+                        entity_text += c
+
+                if entity_text != og_entity_text:
+                    entity_start_offset, entity_end_offset, entity_text = renew_offset(entity_start_offset, entity_end_offset, entity_text, doc_text)
+                    if entity_end_offset is None:
+                        logger.warning("doc text: {} differs from the positions {} in doc_text".format(entity_text,
+                                                                                                          og_entity_text))
+                        continue
+                    # assert entity_text == entity['text']
                 passage_entities.append({'orig_text': entity_text,
                                          'start_position': entity_start_offset,
                                          'end_position': entity_end_offset})
+            choice_info = {}
+            for num in range(2):
+                choice_tag = "choice" + str(num+1)
 
-            for qa in entry["qas"]:
-                if set_type == "test":
-                    qas_id = qa["idx"]
-                    question_text = qa["query"].replace('\xa0', ' ')
-                    example = RecordExample(
-                        qas_id=qas_id,
-                        question_text=question_text,
-                        doc_text=doc_text,
-                        answer_entities=None,
-                        passage_entities=passage_entities,
-                    )
-                    examples.append(example)
-                    continue
+                answer_text = ""
+                for c in line[choice_tag].strip():
+                    if is_whitespace(c):
+                        answer_text += " "
+                    else:
+                        answer_text += c
 
-                qas_id = qa["id"]
-                question_text = qa["query"].replace('\xa0', ' ')
-                answers = qa["answers"]
                 answer_entities = []
 
-                for entity in answers:
+                for entity in line[choice_tag + '_entities']:
                     entity_start_offset = entity['start']
-                    entity_end_offset = entity['end']
-                    if entity_end_offset < entity_start_offset:  # some error labeled entities in record dataset
-                        continue
+                    entity_end_offset =  entity['end']
+                    if entity_end_offset < entity_start_offset:  # some error labeled entities in Copa dataset
+                        logger.warning("weried entity position")
+
+                    og_entity_text = answer_text[entity_start_offset: entity_end_offset + 1]
+                    # entity_text = entity['text']
 
                     entity_text = ""
                     for c in entity['text']:
-                        entity_text += remove_special_punc(c)
+                        if is_whitespace(c):
+                            entity_text += " "
+                        else:
+                            entity_text += c
 
-                    entity_doc_text = doc_text[entity_start_offset: entity_end_offset + 1]
-                    if entity_doc_text != entity_text:
-                        logger.warning("answer text: {} differs from the positions {} in doc_text".format(entity_text,
-                                                                                                          entity_doc_text))
-                        continue
-                    else:
-                        answer_entities.append({'orig_text': entity_text,
-                                                'start_position': entity_start_offset,
-                                                'end_position': entity_end_offset})
+                    if entity_text != og_entity_text:
+                        entity_start_offset, entity_end_offset, entity_text = renew_offset(entity_start_offset,
+                                                                                           entity_end_offset,
+                                                                                           entity_text,
+                                                                                           answer_text)
+                        logger.info("renew: from {} to {}".format(og_entity_text, entity_text))
 
-                example = RecordExample(
-                    qas_id=qas_id,
-                    question_text=question_text,
-                    doc_text=doc_text,
-                    answer_entities=answer_entities,
-                    passage_entities=passage_entities,
-                )
-                examples.append(example)
+                        if entity_end_offset is None:
+                            logger.warning(
+                                "doc text: {} differs from the positions {} in doc_text".format(entity_text,
+                                                                                                og_entity_text))
+                            continue
+                        # assert entity_text == entity['text']
+                    answer_entities.append({'orig_text': entity_text,
+                                              'start_position': entity_start_offset,
+                                              'end_position': entity_end_offset})
+                choice_info[choice_tag] = {"text": answer_text, "entities": answer_entities}
+
+            example = CopaExample(
+                guid="%s-%s" % (set_type, passage_id),
+                doc_text=doc_text,
+                passage_entities=passage_entities,
+                choice_text_list=[choice_info["choice1"]["text"], choice_info["choice2"]["text"]],
+                choice_entities_list=[choice_info["choice1"]["entities"], choice_info["choice2"]["entities"]],
+                label=line["label"] if set_type != "test" else -1,
+                idx=line["idx"]
+            )
+            examples.append(example)
+        # global remove_special_punc_count
+        # logger.info(remove_special_punc_count)
+        if self.fewer_label:
+            logger.info("using fewer label, label rate:{}".format(self.label_rate))
+            examples = examples[:int(len(examples) * self.label_rate)]
         return examples
 
     @classmethod
@@ -922,35 +993,25 @@ class RecordProcessor(DataProcessor):
             n_best_size,
             max_answer_length,
             output_prediction_file,
-            output_result,
+            output_nbest_file,
             verbose_logging,
             predict_file,
-            tokenizer,
-            is_testing,
-            att_score=None,
+            tokenizer
     ):
         """read in the dev.json file"""
         logger.info(" Find {}-best prediction for each qas-id.".format(n_best_size))
         with open(predict_file, "r", encoding='utf-8') as reader:
-            if not is_testing:
-                predict_json = json.load(reader)["data"]
-            else:
-                data_lines = reader.readlines()
-                predict_json = [json.loads(line) for line in data_lines]
-
-            all_candidates = {}
-            for passage in predict_json:
-                passage_text = passage['passage']['text']
-                candidates = []
-                for entity_info in passage['passage']['entities']:
-                    start_offset = entity_info['start']
-                    end_offset = entity_info['end']
-                    candidates.append(passage_text[start_offset: end_offset + 1])
-                for qa in passage['qas']:
-                    if not is_testing:
-                        all_candidates[qa['id']] = candidates
-                    else:
-                        all_candidates[qa['idx']] = candidates
+            predict_json = json.load(reader)["data"]
+            # all_candidates = {}
+            # for passage in predict_json:
+            #     passage_text = passage['passage']['text']
+            #     candidates = []
+            #     for entity_info in passage['passage']['entities']:
+            #         start_offset = entity_info['start']
+            #         end_offset = entity_info['end']
+            #         candidates.append(passage_text[start_offset: end_offset + 1])
+            #     for qa in passage['qas']:
+            #         all_candidates[qa['id']] = candidates
 
         example_index_to_features = collections.defaultdict(list)
         for feature in all_features:
@@ -996,19 +1057,20 @@ class RecordProcessor(DataProcessor):
                 output['end_index'] = entry.end_index
                 nbest_json.append(output)
 
-            best_pred = None
-            for pred in nbest_json:
-                if any([exact_match_score(pred['text'], candidate) > 0. for candidate in all_candidates[example.id]]):
-                    best_pred = pred
-                    break
-            if best_pred is None:
-                for pred in nbest_json:
-                    if any([f1_score(pred['text'], candidate) > 0. for candidate in
-                            all_candidates[example.id]]):
-                        best_pred = pred
-                        break
-            if best_pred is None:
-                best_pred = nbest_json[0]
+            # best_pred = None
+            # # for pred in nbest_json:
+            # #     if any([exact_match_score(pred['text'], candidate) > 0. for candidate in all_candidates[example.id]]):
+            # #         best_pred = pred
+            # #         break
+            # # if best_pred is None:
+            # #     for pred in nbest_json:
+            # #         if any([f1_score(pred['text'], candidate) > 0. for candidate in
+            # #                 all_candidates[example.id]]):
+            # #             best_pred = pred
+            # #             break
+            # if best_pred is None:
+            #     best_pred = nbest_json[0]
+            best_pred = nbest_json[0]
 
             all_predictions[example.id] = (best_pred['text'], best_pred['start_index'], best_pred['end_index'])
             all_nbest_json[example.id] = nbest_json
@@ -1018,17 +1080,16 @@ class RecordProcessor(DataProcessor):
             logger.info(f"Writing predictions to: {output_prediction_file}")
             with open(output_prediction_file, "w") as writer:
                 writer.write(json.dumps(all_predictions, indent=4) + "\n")
-        logger.info(f"Writing results to: {output_result}")
-        output_lines = [to_jsonl(elem_id, elem) for elem_id, elem in all_predictions.items()]
-        output_data_lines = "\n".join(output_lines)
-        with open(output_result, "w") as writer:
-            writer.write(output_data_lines)
-            writer.write("\n")
+
+        # if output_nbest_file:
+        #     logger.info(f"Writing nbest to: {output_nbest_file}")
+        #     with open(output_nbest_file, "w") as writer:
+        #         writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
 
         return all_predictions
 
     @classmethod
-    def record_evaluate(cls, examples, predictions, relate_path):
+    def copa_evaluate(cls, examples, predictions, relate_path="./data/"):
         evaluates = dict()
 
         f1 = exact_match = total = 0
@@ -1062,31 +1123,9 @@ class RecordProcessor(DataProcessor):
 
 
 def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
-                         orig_answer_text):
+                         orig_answer_text, is_answer=False):
     """Returns tokenized answer spans that better match the annotated answer."""
 
-    # The ReCoRD annotations are character based. We first project them to
-    # whitespace-tokenized words. But then after WordPiece tokenization, we can
-    # often find a "better match". For example:
-    #
-    #   Question: What year was John Smith born?
-    #   Context: The leader was John Smith (1895-1943).
-    #   Answer: 1895
-    #
-    # The original whitespace-tokenized answer will be "(1895-1943).". However
-    # after tokenization, our tokens will be "( 1895 - 1943 ) .". So we can match
-    # the exact answer, 1895.
-    #
-    # However, this is not always possible. Consider the following:
-    #
-    #   Question: What country is the top exporter of electornics?
-    #   Context: The Japanese electronics industry is the lagest in the world.
-    #   Answer: Japan
-    #
-    # In this case, the annotator chose "Japan" as a character sub-span of
-    # the word "Japanese". Since our WordPiece tokenizer does not split
-    # "Japanese", we just use "Japanese" as the annotation. This is fairly rare
-    # in ReCoRD, but does happen.
     tok_answer_text = " ".join(tokenizer.tokenize(orig_answer_text))
 
     for new_start in range(input_start, input_end + 1):
@@ -1094,49 +1133,72 @@ def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
             text_span = " ".join(doc_tokens[new_start:(new_end + 1)])
             if text_span == tok_answer_text:
                 return (new_start, new_end)
-
+    if is_answer:
+        logger.warning("no exact match answer entities")
     return (input_start, input_end)
 
 
-class RecordFeature(object):
+class CopaFeature(object):
     """A single set of features of data."""
 
     def __init__(self,
+                 guid,
                  unique_id,
-                 qas_id,
                  example_index,
+                 label_id,
+                 # doc_span_index,
+                 tokens_list,
+                 # tokid_span_to_orig_map,
+                 input_ids_list,
+                 attention_mask_list,
+                 token_type_ids_list,
+                 kgs_concept_ids_list,
+                 kgs_conceptids2synset_list,
+                 ):
+        self.guid = guid
+        self.unique_id = unique_id
+        self.example_index = example_index
+        self.label_id = label_id
+        self.tokens_list = tokens_list
+        # self.tokid_span_to_orig_map = tokid_span_to_orig_map
+        self.input_ids_list = input_ids_list
+        self.attention_mask_list = attention_mask_list
+        self.token_type_ids_list = token_type_ids_list
+        self.kgs_concept_ids_list = kgs_concept_ids_list
+        self.kgs_conceptids2synset_list = kgs_conceptids2synset_list
+
+class CopaFeature_choice(object):
+    """A single set of features of data."""
+
+    def __init__(self,
+                 guid,
+                 unique_id,
+                 example_index,
+                 label_id,
                  # doc_span_index,
                  tokens,
-                 tokid_span_to_orig_map,
+                 # tokid_span_to_orig_map,
                  input_ids,
                  attention_mask,
                  token_type_ids,
                  kgs_concept_ids,
                  kgs_conceptids2synset,
-                 kgs_definition_ids=None,
-                 kgs_graphs=None,
-                 start_position=None,
-                 end_position=None,
                  ):
+        self.guid = guid
         self.unique_id = unique_id
-        self.qas_id = qas_id
         self.example_index = example_index
+        self.label_id = label_id
         self.tokens = tokens
-        self.tokid_span_to_orig_map = tokid_span_to_orig_map
+        # self.tokid_span_to_orig_map = tokid_span_to_orig_map
         self.input_ids = input_ids
         self.attention_mask = attention_mask
         self.token_type_ids = token_type_ids
-        self.start_position = start_position
-        self.end_position = end_position
         self.kgs_concept_ids = kgs_concept_ids
-        self.kgs_definition_ids = kgs_definition_ids
-        self.kgs_graphs = kgs_graphs
         self.kgs_conceptids2synset = kgs_conceptids2synset
-
-
-class RecordResult(object):
+        
+class CopaResult(object):
     """
-    Constructs a SquadResult which can be used to evaluate a model's output on the SQuAD dataset.
+    Constructs a Coparesult which can be used to evaluate a model's output on the Copa dataset.
 
     Args:
         unique_id: The unique identifier corresponding to that example.
@@ -1251,7 +1313,7 @@ def build_first_part_features(tokenizer_type, use_kg, query_tokens, query_kgs_co
     return tokens, segment_ids, kgs_concept_ids
 
 
-def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tokenizer):
+def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tokenizer, entity_strings):
     """
     Find the index of entities in the query.
     :param text:
@@ -1261,9 +1323,9 @@ def match_query_entities(text, document_entities, ori_to_tok_map, subtokens, tok
     :return:
     """
 
-    entity_strings = set()
-    for document_entity in document_entities:
-        entity_strings.add(document_entity[0])  # .lower())
+    # entity_strings = set()
+    # for document_entity in document_entities:
+    #     entity_strings.add(document_entity[0])  # .lower())
 
     # text_lower = text.lower()
 
@@ -1363,49 +1425,67 @@ def create_tensordataset(features, is_training, args, retrievers, tokenizer, rel
         multi_relation_dict = retrive_multi_relation_dict(relation_list, wn18_dir)
         all_kgs_graphs = []
         for f in tqdm(features, desc="build dgl graph", disable=not tqdm_enabled, ):
-            for c_id, syn in f.kgs_conceptids2synset["wordnet"].items():
-                if c_id in retrievers["wordnet"].conceptids2synset:
-                    continue
-                retrievers["wordnet"].conceptids2synset[c_id] = syn
-
-            g = graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer,
-                                multi_relation_dict, retrievers["wordnet"], encoder, defid2def, conceptid2defid,
-                                )
-            all_kgs_graphs.append(g)
+            tmp_graph_list = []
+            for num in range(2):
+                for c_id, syn in f.kgs_conceptids2synset_list[num]["wordnet"].items():
+                    if c_id in retrievers["wordnet"].conceptids2synset:
+                        continue
+                    retrievers["wordnet"].conceptids2synset[c_id] = syn
+                
+                tmp_f = CopaFeature_choice(
+                                guid=f.guid,
+                                unique_id=f.unique_id,
+                                example_index=f.example_index,
+                                label_id=f.label_id,
+                                tokens=f.tokens_list[num],
+                                # tokid_span_to_orig_map=(tok_offset, doc_span.start, doc_span.length),
+                                input_ids=f.input_ids_list[num],
+                                attention_mask=f.attention_mask_list[num],
+                                token_type_ids=f.token_type_ids_list[num],
+                                kgs_concept_ids=f.kgs_concept_ids_list[num],
+                                kgs_conceptids2synset=f.kgs_conceptids2synset_list[num],
+                            )
+                g = graph_collecter(tmp_f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_list, tokenizer,
+                                    multi_relation_dict, retrievers["wordnet"], encoder, defid2def, conceptid2defid,
+                                    )
+                tmp_graph_list.append(g)
+            all_kgs_graphs.append(tmp_graph_list)
     else:
         all_kgs_graphs = None
 
     assert len(conceptid2defid) == len(defid2def)
 
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_attention_masks = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
-    all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
-    all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+    all_input_ids = torch.tensor([f.input_ids_list for f in features], dtype=torch.long)
+    all_attention_masks = torch.tensor([f.attention_mask_list for f in features], dtype=torch.long)
+    all_token_type_ids = torch.tensor([f.token_type_ids_list for f in features], dtype=torch.long)
+    # all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+    all_feature_index = torch.tensor([f.example_index for f in features], dtype=torch.long)
     all_kgs_concept_tuple = tuple()
     for kg in args.use_kgs:
-        all_concept_ids = torch.tensor([f.kgs_concept_ids[kg] for f in features], dtype=torch.long)
+        all_concept_ids = torch.tensor([[f.kgs_concept_ids_list[num][kg] for num in range(2)] for f in features], dtype=torch.long)
         # all_definition_ids = torch.tensor([f.kgs_definition_ids[kg] for f in features], dtype=torch.long)
         # all_kgs_concept_tuple = all_kgs_concept_tuple+(all_concept_ids, all_definition_ids, )
         all_kgs_concept_tuple = all_kgs_concept_tuple + (all_concept_ids,)
-
-    if not is_training:
-        dataset = TensorDataset(all_input_ids, all_attention_masks, all_token_type_ids, all_feature_index,
-                                *all_kgs_concept_tuple)
-    else:
-        all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
-        all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
-        dataset = TensorDataset(
-            all_input_ids,
-            all_attention_masks,
-            all_token_type_ids,
-            all_feature_index,
-            all_start_positions,
-            all_end_positions,
-            *all_kgs_concept_tuple,
-        )
+    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+    all_qas_ids = torch.tensor([f.example_index for f in features], dtype=torch.long)
+    assert [f.example_index for f in features] == [int(f.guid[0].split("-")[1]) for f in features]
+    # if not is_training:
+    dataset = TensorDataset(all_input_ids, all_attention_masks, all_token_type_ids, all_feature_index,
+                            all_label_ids, all_qas_ids, *all_kgs_concept_tuple)
+    # else:
+    #     all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
+    #     all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
+    #     dataset = TensorDataset(
+    #         all_input_ids,
+    #         all_attention_masks,
+    #         all_token_type_ids,
+    #         all_feature_index,
+    #         all_start_positions,
+    #         all_end_positions,
+    #         *all_kgs_concept_tuple,
+    #     )
 
     return dataset, all_kgs_graphs
-
 
 def retrive_multi_relation_dict(relation_list, wn18_dir):
     multi_relation_dict_path = os.path.join(wn18_dir, "multi_relation_dict.npy")
@@ -1484,7 +1564,7 @@ def graph_collecter(f, wn18_dir, offset_to_wn18name_dict, concept2id, relation_l
     # assert ([i for i in wn_hyponyms_conceptid2nodeid.keys()] == wn_hyponyms_nodeid2conceptid)
     #
     for token_id, concept_list in enumerate(nell_concept_input):
-        if concept_list[0] == 0:
+        if not concept_list or concept_list[0] == 0:
             continue
         for i, concept_id in enumerate(concept_list):
             if concept_id == 0:
@@ -1594,36 +1674,51 @@ def get_tokenized_definition(nodeid2conceptid, conceptids2synset, tokenizer):
 
 
 def create_input(args, batch, global_step, batch_synset_graphs=None, wn_synset_graphs=None, evaluate=False):
-    if evaluate:
-        inputs = {
-            "input_ids": batch[0],
-            "attention_mask": batch[1],
-            "token_type_ids": batch[2],
-            "global_step": global_step,
-            "batch_synset_graphs": batch_synset_graphs,
-            "wn_synset_graphs": wn_synset_graphs,
-        }
+    # if evaluate:
+    inputs = {
+        "input_ids": batch[0],
+        "attention_mask": batch[1],
+        "token_type_ids": batch[2],
+        "global_step": global_step,
+        "batch_synset_graphs": batch_synset_graphs,
+        "wn_synset_graphs": wn_synset_graphs,
+        "label_ids": batch[4],
+        "qas_ids": batch[5],
+    }
 
-        for i, kg in enumerate(args.use_kgs):
-            name = kg + "_concept_ids"
-            inputs[name] = batch[4 + i]
+    for i, kg in enumerate(args.use_kgs):
+        name = kg + "_concept_ids"
+        inputs[name] = batch[6 + i]
 
-    else:
-        inputs = {
-            "input_ids": batch[0],
-            "attention_mask": batch[1],
-            "token_type_ids": batch[2],
-            "start_positions": batch[4],
-            "end_positions": batch[5],
-            "global_step": global_step,
-            "batch_synset_graphs": batch_synset_graphs,
-            "wn_synset_graphs": wn_synset_graphs,
-        }
+        # for i, kg in enumerate(args.use_kgs):
+        #     name = kg+"_concept_ids"
+        #     inputs[name] = batch[4+i*2]
+        # for i, kg in enumerate(args.use_kgs):
+        #     name = kg+"_definition_ids"
+        #     inputs[name] = batch[5+i*2]
 
-        for i, kg in enumerate(args.use_kgs):
-            name = kg + "_concept_ids"
-            inputs[name] = batch[6 + i]
+    # else:
+    #     inputs = {
+    #         "input_ids": batch[0],
+    #         "attention_mask": batch[1],
+    #         "token_type_ids": batch[2],
+    #         "start_positions": batch[4],
+    #         "end_positions": batch[5],
+    #         "global_step": global_step,
+    #         "batch_synset_graphs": batch_synset_graphs,
+    #         "wn_synset_graphs": wn_synset_graphs,
+    #     }
+    #
+    #     for i, kg in enumerate(args.use_kgs):
+    #         name = kg + "_concept_ids"
+    #         inputs[name] = batch[6 + i]
 
+        # for i, kg in enumerate(args.use_kgs):
+        #     name = kg+"_concept_ids"
+        #     inputs[name] = batch[6+i*2]
+        # for i, kg in enumerate(args.use_kgs):
+        #     name = kg+"_definition_ids"
+        #     inputs[name] = batch[7+i*2]
     if args.model_type == "roberta" or args.model_type == "roberta_base":
         del inputs["token_type_ids"]
         del inputs["global_step"]
@@ -1694,6 +1789,7 @@ def get_final_text(pred_text, orig_text, tokenizer, verbose=False):
         if verbose:
             logger.info("Couldn't map start position")
         return orig_text
+        # return pred_text.strip()
 
     orig_end_position = None
     if end_position in tok_s_to_ns_map:
@@ -1754,6 +1850,8 @@ def find_nbest_prediction_for_example(prelim_predictions, n_best_size, example, 
         pred_start_index = -1
         pred_end_index = -1
         if pred.start_index > -1:  # this is a non-null prediction
+            # ori_tok_start = feature.tokid_span_to_orig_map[pred.start_index]
+            # ori_tok_end = feature.tokid_span_to_orig_map[pred.end_index]
 
             pred_start_index = pred.start_index - feature.tokid_span_to_orig_map[0] + feature.tokid_span_to_orig_map[1]
             pred_end_index = pred.end_index - feature.tokid_span_to_orig_map[0] + feature.tokid_span_to_orig_map[1]
@@ -1762,20 +1860,30 @@ def find_nbest_prediction_for_example(prelim_predictions, n_best_size, example, 
             orig_doc_end = example.doc_tok_to_ori_map[pred_end_index]
             orig_doc_start, orig_doc_end = refine_char_start_end(orig_doc_start, orig_doc_end,
                                                                  example.doc_ori_to_tok_map)
+            # try:
             orig_text = example.doc_text[orig_doc_start: (orig_doc_end + 1)].strip()
-
+            # except:
+            #     orig_text = example.doc_text[orig_doc_start: orig_doc_end]
             tok_tokens = feature.tokens[pred.start_index: (pred.end_index + 1)]
             if isinstance(tokenizer, RobertaTokenizer):
                 tok_text = tokenizer.convert_tokens_to_string(tok_tokens).strip()
             elif isinstance(tokenizer, BertTokenizer):
+                # tok_text = " ".join(tok_tokens)
+                # tok_text = tok_text.replace(" ##", "")
+                # tok_text = tok_text.replace("##", "")
+                # tok_text = tok_text.strip()
+                # tok_text = " ".join(tok_text.split())
+
                 tok_text = tokenizer.convert_tokens_to_string(tok_tokens)
                 tok_text = tok_text.strip()
                 tok_text = " ".join(tok_text.split())
+
 
             final_text = get_final_text(tok_text, orig_text, tokenizer, verbose_logging)
             if final_text in seen_predictions:
                 continue
         else:
+            # orig_text = ""
             final_text = ""
             seen_predictions[""] = True
 
@@ -1865,6 +1973,16 @@ def roberta_from_string_to_subtokens(subtokens, tokenizer):
         to_check = False
     return text_from_sub, ori_to_sub_map, sub_to_ori_map
 
+
+def check_definition_list(d):
+    for i in range(len(d)):
+        if not isinstance(d[i], list):
+            print("wrong_type{}".format(i))
+        for j in range(len(d[i])):
+            if not isinstance(d[i][j], list) or d[i][j][0] != 101:
+                print("wrong_type{}   {}".format(i, j))
+
+
 def check_concept_list(w):
     for i in range(len(w)):
         if not isinstance(w[i], list):
@@ -1875,5 +1993,46 @@ def check_concept_list(w):
                 print("wrong_type{}   {}".format(i, j))
                 print(w[i][j])
 
-def to_jsonl(elem_id, elem):
-    return json.dumps({"idx": elem_id, "label": elem[0]}).replace("\n", "")
+
+def is_whitespace(c):
+    if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or ord(c) == 0x200e:
+        return True
+    cat = unicodedata.category(c)
+    if cat == "Zs":
+        return True
+    return False
+
+def remove_special_punc(c):
+    global remove_special_punc_count
+    if c == "‘":
+        logger.warning("remove_special_punc is triggered")
+        remove_special_punc_count += 1
+        return "\'"
+    if c == "’":
+        logger.warning("remove_special_punc is triggered")
+        remove_special_punc_count += 1
+        return "\'"
+    if c == "“":
+        logger.warning("remove_special_punc is triggered")
+        remove_special_punc_count += 1
+        return "\""
+    if c == "”":
+        logger.warning("remove_special_punc is triggered")
+        remove_special_punc_count += 1
+        return "\""
+    return c
+
+def renew_offset(og_start, og_end, og_text, all_text):
+    for new_start in range(max(0, og_start-5), min(og_start+3, len(all_text))):
+        for new_end in range(max(0, og_end - 5), min(og_end + 3, len(all_text))):
+            if new_start > new_end:
+                continue
+            entity_text = all_text[new_start: new_end + 1]
+            if og_text == entity_text:
+                return new_start, new_end, entity_text
+    return None, None, og_text
+
+def read_json_lines(path, mode="r", encoding="utf-8", **kwargs):
+    with open(path, mode=mode, encoding=encoding, **kwargs) as f:
+        for line in f.readlines():
+            yield json.loads(line)

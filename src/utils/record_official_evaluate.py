@@ -40,9 +40,9 @@ def record_evaluate(dataset, predictions):
     return {'exact_match': exact_match, 'f1': f1}, correct_ids
 
 
-
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
+
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
 

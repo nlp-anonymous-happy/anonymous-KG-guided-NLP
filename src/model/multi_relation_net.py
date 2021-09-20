@@ -112,24 +112,3 @@ def collate(samples):
     batched_graph = dgl.batch(graphs)
     batched_labels = torch.tensor(labels)
     return batched_graph, batched_labels
-
-
-if __name__ == '__main__':
-    dataset = dgl.data.GINDataset('MUTAG', False)
-    etypes= set(dataset[0].edata['etype'])
-    dataloader = DataLoader(
-        dataset,
-        batch_size=1024,
-        collate_fn=collate,
-        drop_last=False,
-        shuffle=True)
-    # etypes is the list of edge types as strings.
-    model = HeteroClassifier(10, 20, 5, etypes)
-    opt = torch.optim.Adam(model.parameters())
-    for epoch in range(20):
-        for batched_graph, labels in dataloader:
-            logits = model(batched_graph)
-            loss = F.cross_entropy(logits, labels)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()

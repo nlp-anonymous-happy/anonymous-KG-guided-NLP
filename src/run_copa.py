@@ -42,8 +42,10 @@ from transformers import (
 from model.model_utils import configure_tokenizer_model
 from kgs_retrieve.kg_utils import initialize_kg_retriever
 from utils.args import ArgumentGroup
-from text_processor.record import RecordResult, RecordProcessor, create_input, DefinitionInfo
+from text_processor.copa import CopaResult, CopaProcessor, create_input, DefinitionInfo
 from dgl import save_graphs, load_graphs
+import pandas as pd
+from sklearn.metrics import f1_score
 
 import resource
 
@@ -234,22 +236,11 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 outputs = model(**inputs)
                 # model outputs are always tuple in transformers (see doc)
                 loss = outputs[0]
-                if args.model_type in ["bert", "roberta", "roberta_base"]:
-                    loss_dic = {
-                        'loss_wn': torch.tensor(0.0, device=args.device),
-                        'loss_cls': torch.tensor(0.0, device=args.device),
-                    }
-                else:
-                    loss_dic = outputs[3]
 
                 if args.n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
-                    for k in loss_dic.keys():
-                        loss_dic[k] = loss_dic[k].mean()
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
-                    for k in loss_dic.keys():
-                        loss_dic[k] = loss_dic[k] / args.gradient_accumulation_steps
 
                 if args.use_fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -257,27 +248,19 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 else:
                     loss.backward()
 
-                return loss.detach(), loss_dic
+                return loss.detach()
 
             if (step + 1) % args.gradient_accumulation_steps != 0:
                 with model.no_sync():
-                    loss, loss_dic = training_step(batch)
+                    loss = training_step(batch)
             else:
-                loss, loss_dic = training_step(batch)
+                loss = training_step(batch)
 
             tr_loss += loss.item()
             if args.local_rank in [-1, 0] and (step + 1) % args.gradient_accumulation_steps == 0:
                 logger.info('total loss during training {} at {}'.format(loss.item(), global_step))
 
-            for k, v in loss_dic.items():
-                if k not in tr_loss_dic:
-                    tr_loss_dic[k] = 0.0
-                if k not in logging_loss_dic:
-                    logging_loss_dic[k] = 0.0
-                tr_loss_dic[k] += v.item()
-
             if (step + 1) % args.gradient_accumulation_steps == 0:
-
                 if args.local_rank in [-1, 0] and global_step == 1:
                     tb_writer.add_scalar("loss", tr_loss, int(global_step * all_train_size / 24))
 
@@ -344,13 +327,8 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                         tb_writer.add_scalar("lr", scheduler.get_lr()[0], int(global_step * all_train_size / 24))
                         tb_writer.add_scalar("loss", (tr_loss - logging_loss) / train_loss_record_steps,
                                              int(global_step * all_train_size / 24))
-                        for k, v in tr_loss_dic.items():
-                            tb_writer.add_scalar(f'loss/{k}', (v - logging_loss_dic[k]) / train_loss_record_steps,
-                                                 int(global_step * all_train_size / 24))
 
                     logging_loss = tr_loss
-                    for k, v in tr_loss_dic.items():
-                        logging_loss_dic[k] = v
 
                 # if args.memory_bank_update and args.use_context_graph and global_step % args.memory_bank_update_steps == 0:
                 #     model.eval()
@@ -507,9 +485,13 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         exit()
     else:
         # all_results = []
-        all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_unique_ids = []
+        # all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_unique_ids = []
+        all_pred = torch.tensor([], dtype=torch.long, device=args.device)
+        all_label_ids = torch.tensor([], dtype=torch.long, device=args.device)
+        all_question_ids = torch.tensor([], dtype=torch.long, device=args.device)
+
         # start_time = timeit.default_timer()
         epoch_iterator = tqdm(eval_dataloader, desc="Evaluating Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -523,28 +505,23 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
                 outputs = model(**inputs)
 
-            all_start_logits = torch.cat((all_start_logits, outputs[0]), dim=0)
-            all_end_logits = torch.cat((all_end_logits, outputs[1]), dim=0)
-
-            for i, feature_index in enumerate(feature_indices):
-                eval_feature = features[feature_index.item()]
-                unique_id = int(eval_feature.unique_id)
-                all_unique_ids.append(unique_id)
-
-        all_unique_ids = torch.tensor(all_unique_ids, dtype=torch.long, device=args.device)
+            logits, label_ids, qas_ids = outputs[1], outputs[2], outputs[3]
+            all_pred = torch.cat((all_pred, torch.argmax(logits, axis=-1)), dim=0)
+            all_label_ids = torch.cat((all_label_ids, label_ids), dim=0)
+            all_question_ids = torch.cat((all_question_ids, qas_ids), dim=0)
 
         start_time = timeit.default_timer()
 
-        all_start_logits_list = [torch.zeros_like(all_start_logits, device=args.device) for _ in
+        all_pred_list = [torch.zeros_like(all_pred, device=args.device) for _ in
                                  range(torch.distributed.get_world_size())]
-        all_end_logits_list = [torch.zeros_like(all_end_logits, device=args.device) for _ in
+        all_label_ids_list = [torch.zeros_like(all_label_ids, device=args.device) for _ in
                                range(torch.distributed.get_world_size())]
-        all_unique_ids_list = [torch.zeros_like(all_unique_ids, device=args.device) for _ in
+        all_question_ids_list = [torch.zeros_like(all_question_ids, device=args.device) for _ in
                                range(torch.distributed.get_world_size())]
 
-        all_gather(all_start_logits_list, all_start_logits)
-        all_gather(all_end_logits_list, all_end_logits)
-        all_gather(all_unique_ids_list, all_unique_ids)
+        all_gather(all_pred_list, all_pred)
+        all_gather(all_label_ids_list, all_label_ids)
+        all_gather(all_question_ids_list, all_question_ids)
 
         logger.info(
             "time for gather communication:{} in rank {}".format(timeit.default_timer() - start_time, args.local_rank))
@@ -552,43 +529,21 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         if args.local_rank == 0:
             start_time = timeit.default_timer()
             all_results = []
-            all_unique_ids_list = all_unique_ids_list
-            all_start_logits_list = all_start_logits_list
-            all_end_logits_list = all_end_logits_list
+            all_pred_list = all_pred_list
+            all_label_ids_list = all_label_ids_list
+            all_question_ids_list = all_question_ids_list
 
-            for batch_idx, batch_unique_ids in enumerate(all_unique_ids_list):
-                batch_start_logits = all_start_logits_list[batch_idx]
-                batch_end_logits = all_end_logits_list[batch_idx]
-                for i, unique_id in enumerate(batch_unique_ids):
-                    # output = [to_list(output[i]) for output in batch_logits]
-                    start_logits, end_logits = to_list(batch_start_logits[i]), to_list(batch_end_logits[i])
-                    result = RecordResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
+            preds = np.asarray([], dtype=int)
+            label_values = np.asarray([], dtype=int)
+            question_ids = np.asarray([], dtype=int)
+            for batch_idx, batch_preds in enumerate(all_pred_list):
+                preds = np.concatenate((preds, batch_preds.cpu().detach().numpy()), axis=0)
+                label_values = np.concatenate((label_values, all_label_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
+                question_ids = np.concatenate((question_ids, all_question_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
 
-                    all_results.append(result)
+            acc = float((preds == label_values).mean())
 
-            evalTime = timeit.default_timer() - start_time
-            logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
-
-            # Compute predictions
-            output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-            output_result = os.path.join(args.output_dir, "results_{}.jsonl".format(prefix))
-
-            predictions = RecordProcessor.compute_predictions_logits(
-                examples_tokenized,
-                features,
-                all_results,
-                args.n_best_size,
-                args.max_answer_length,
-                output_prediction_file,
-                output_result,
-                args.verbose_logging,
-                os.path.join(args.data_dir, args.predict_file),
-                tokenizer,
-                is_testing=args.test,
-            )
-
-            # Compute the F1 and exact scores.
-            results = RecordProcessor.record_evaluate(examples_tokenized, predictions, relate_path=args.output_dir)
+            results = {'acc': acc}
             return results
         else:
             return None
@@ -629,7 +584,12 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
             features_and_dataset["examples"],
         )
 
-        all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
+        all_kgs_graphs = []
+        all_kgs_graphs_label_dict = []
+        for num in range(2):
+            tmp_all_kgs_graphs, tmp_all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs_choice_{}.bin".format(num))
+            all_kgs_graphs.append(tmp_all_kgs_graphs)
+            all_kgs_graphs_label_dict.append(tmp_all_kgs_graphs_label_dict)
     else:
         logger.error("dataset not exist and program exits")
         exit()
@@ -675,6 +635,7 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
 
         logger.info("Creating features from dataset file at %s", input_dir)
 
+        # if not os.path.exists("../tmp/examples_tokenized"):
         examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
 
         examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
@@ -687,8 +648,10 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+            for num in range(2):
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                tmp_all_kgs_graphs = [gg[num] for gg in all_kgs_graphs]
+                save_graphs(cached_features_file + "_all_kgs_graphs_choice_{}.bin".format(num), tmp_all_kgs_graphs, all_kgs_graphs_label_dict)
             logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
@@ -745,14 +708,19 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+            for num in range(2):
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                tmp_all_kgs_graphs = [gg[num] for gg in all_kgs_graphs]
+                save_graphs(cached_features_file + "_all_kgs_graphs_choice_{}.bin".format(num), tmp_all_kgs_graphs, all_kgs_graphs_label_dict)
+
+            # all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+            # save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
             logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
 
             for f in features:
-                del f.kgs_conceptids2synset
+                del f.kgs_conceptids2synset_list
             torch.save({"features": features, "dataset": dataset, "examples": examples_tokenized}, cached_features_file)
 
             logger.info("saving definition embedding")
@@ -821,7 +789,7 @@ def main():
 
     model_g = ArgumentGroup(parser, "model", "model configuration and path.")
 
-    model_g.add_arg("dataset", str, "record", "used dataset")
+    model_g.add_arg("dataset", str, "copa", "used dataset")
     model_g.add_arg("is_update_max_concept", bool, False, "weather update max concept for kg retriver")
     model_g.add_arg("full_table", bool, False, "full_table")
     model_g.add_arg("test", bool, False, "weather load superglue test set")
@@ -846,7 +814,7 @@ def main():
     model_g.add_arg("is_lemma", bool, False, "whether trigger lemma")
     model_g.add_arg("is_filter", bool, True, "weather filter node not in wn18")
     model_g.add_arg("is_clean", bool, True, "weather filter node not in repeated_id")
-    model_g.add_arg("is_morphy", bool, False, "weather morphy")
+    model_g.add_arg("is_morphy", bool, True, "weather morphy")
     model_g.add_arg("fewer_label", bool, False, "weather fewer_label")
     model_g.add_arg("label_rate", float, 0.1, "label rate")
 
@@ -903,7 +871,7 @@ def main():
                     "The total number of n-best predictions to generate in the nbest_predictions.json output file.")
     model_g.add_arg("verbose_logging", bool, False,
                     "If true, all of the warnings related to data processing will be printed. "
-                    "A number of warnings are expected for a normal SQuAD evaluation.")
+                    "A number of warnings are expected for a normal Copa evaluation.")
     model_g.add_arg("init_dir", str, "../cache/bert-large-cased/", "The path of loading pre-trained model.")
     model_g.add_arg("initializer_range", float, 0.02, "The initializer range for KELM")
     model_g.add_arg("cat_mul", bool, True, "The output part of vector in KELM")
@@ -913,8 +881,8 @@ def main():
     model_g.add_arg("cat_twotime_sub", bool, False, "The output part of vector in KELM")
 
     data_g = ArgumentGroup(parser, "data", "Data paths, vocab paths and data processing options")
-    data_g.add_arg("train_file", str, "record/train.json", "ReCoRD json for training. E.g., train.json.")
-    data_g.add_arg("predict_file", str, "record/dev.json", "ReCoRD json for predictions. E.g. dev.json.")
+    data_g.add_arg("train_file", str, "copa/train.tagged.jsonl", "Copa json for training. E.g., train.json.")
+    data_g.add_arg("predict_file", str, "copa/val.tagged.jsonl", "Copa json for predictions. E.g. dev.json.")
     data_g.add_arg("cache_file_suffix", str, "test", "The suffix of cached file.")
     data_g.add_arg("cache_dir", str, "../cache/", "The cached data path.")
     data_g.add_arg("cache_store_dir", str, "../cache/", "The cached data path.")
@@ -931,11 +899,11 @@ def main():
     data_g.add_arg("nell_concept_embedding_path", str, "embedded/nell_concept2vec.txt",
                    "The embeddings of concept in knowledge graph : Nell.")
     data_g.add_arg("use_kgs", list, ['nell', 'wordnet'], "The used knowledge graphs.")
-    data_g.add_arg("doc_stride", int, 128,
-                   "When splitting up a long document into chunks, how much stride to take between chunks.")
-    data_g.add_arg("max_seq_length", int, 384, "Number of words of the longest seqence.")
-    data_g.add_arg("max_query_length", int, 64, "Max query length.")
-    data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
+    # data_g.add_arg("doc_stride", int, 128,
+    #                "When splitting up a long document into chunks, how much stride to take between chunks.")
+    data_g.add_arg("max_seq_length", int, 64, "Number of words of the longest seqence.")
+    # data_g.add_arg("max_query_length", int, 64, "Max query length.")
+    # data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
     data_g.add_arg("no_stopwords", bool, True, "Whether to include stopwords.")
     data_g.add_arg("ignore_length", int, 0, "The smallest size of token.")
     data_g.add_arg("print_loss_step", int, 100, "The steps to print loss.")
@@ -959,7 +927,7 @@ def main():
     run_type_g.add_arg("overwrite_cache", bool, False, "Overwrite the cached training and evaluation sets")
     run_type_g.add_arg("eval_all_checkpoints", bool, False,
                        "Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
-    run_type_g.add_arg("min_diff_steps", int, 50, "The minimum saving steps before the last maximum steps.")
+    run_type_g.add_arg("min_diff_steps", int, 5, "The minimum saving steps before the last maximum steps.")
     args = parser.parse_args()
 
     logging.getLogger("transformers.modeling_utils").setLevel(logging.WARNING)  # Reduce model loading logs
@@ -968,12 +936,12 @@ def main():
         args.relation_list = args.selected_relation.split(",")
         logger.info("not use all relation, relation_list: {}".format(args.relation_list))
 
-    if args.doc_stride >= args.max_seq_length - args.max_query_length:
-        logger.warning(
-            "WARNING - You've set a doc stride which may be superior to the document length in some "
-            "examples. This could result in errors when building features from the examples. Please reduce the doc "
-            "stride or increase the maximum length to ensure the features are correctly built."
-        )
+    # if args.doc_stride >= args.max_seq_length - args.max_query_length:
+    #     logger.warning(
+    #         "WARNING - You've set a doc stride which may be superior to the document length in some "
+    #         "examples. This could result in errors when building features from the examples. Please reduce the doc "
+    #         "stride or increase the maximum length to ensure the features are correctly built."
+    #     )
 
     if (
             os.path.exists(args.output_dir)
@@ -1041,7 +1009,7 @@ def main():
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-    processor = RecordProcessor(args)
+    processor = CopaProcessor(args)
 
     input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}".format(
         args.model_type,

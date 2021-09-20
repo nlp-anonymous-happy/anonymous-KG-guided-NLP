@@ -31,8 +31,8 @@ class KGRetriever(object):
     def lookup_concept_ids(self, tokenization_info, **kwargs):
         raise NotImplementedError
 
-    def id2concept_check(self, id):
-        return self.id2concept[id]
+    def id2concept_check(self, entity_id):
+        return self.id2concept[entity_id]
 
 def read_concept_embedding(embedding_path):
     fin = open(embedding_path, encoding='utf-8')

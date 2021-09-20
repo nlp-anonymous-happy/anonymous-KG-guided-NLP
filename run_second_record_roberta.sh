@@ -3,38 +3,38 @@ mkdir log
 fi
 
 DATA_DIR=./data/
-INIT_DIR=./outputs/new_exp_first/checkpoint-21000/
+INIT_DIR=./checkpoint/checkpoint/
 CACHE_DIR=./cache/
 CACHE_STORE_DIR=./cache/
-Model_name_or_path=./cache/bert-large-cased/
-Config_name=./cache/bert-large-cased/
-TOKENIZER_PATH=./cache/bert-large-cased/
+Model_name_or_path=./cache/roberta-large/
+Config_name=./cache/roberta-large/
+TOKENIZER_PATH=./cache/roberta-large/
 WN18_DIR=./data/kgs/wn18/text/
 TRAIN_FILE=record/train.json
 PRED_FILE=record/dev.json
 
-mark=new_exp_second
+mark=record_exp_second
 mark_r=${mark}_train_second
 
 OUTPUT_DIR=./outputs/${mark}
 Tensorboard_dir=./runs
 PWD_DIR=`pwd`
 
-CUDA_VISIBLE_DEVICES=1,2,3,7 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
-  --cache_file_suffix full_test_2 \
+CUDA_VISIBLE_DEVICES=2,4,5,6 python -m torch.distributed.launch --nproc_per_node=4 --master_port=83498 src/run_record_qa.py \
+  --cache_file_suffix record_roberta_cache \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
-  --warmup_steps 510 \
-  --max_steps 8500 \
+  --warmup_steps 390 \
+  --max_steps 6500 \
   --mark  $mark_r \
   --tensorboard_dir $Tensorboard_dir \
   --model_type kelm \
-  --text_embed_model bert \
+  --text_embed_model roberta \
   --save_steps 2000 \
   --evaluate_steps 2000 \
-  --learning_rate 2e-5 \
-  --num_train_epochs 4 \
+  --evaluate_epoch 1.0 \
+  --learning_rate 1e-5 \
   --threads 50 \
   --is_all_relation false \
   --freeze false \
@@ -58,5 +58,5 @@ CUDA_VISIBLE_DEVICES=1,2,3,7 python -m torch.distributed.launch --nproc_per_node
   --full_table false \
   --use_context_graph false \
   --use_wn true \
-  --use_nell true \
+  --use_nell false \
   --seed 45 1>$PWD_DIR/log/kelm.${mark_r} 2>&1

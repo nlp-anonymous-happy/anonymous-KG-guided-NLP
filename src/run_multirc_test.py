@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import argparse
+import collections
+import json
 import glob
 import logging
 import os
@@ -22,22 +24,30 @@ import random
 import timeit
 import sys
 import numpy as np
+from tqdm import tqdm, trange
+import math
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import all_gather
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn as nn
+from transformers import (
+    MODEL_FOR_QUESTION_ANSWERING_MAPPING,
+    WEIGHTS_NAME,
+    AdamW,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+)
 
 from model.model_utils import configure_tokenizer_model
 from kgs_retrieve.kg_utils import initialize_kg_retriever
 from utils.args import ArgumentGroup
-from text_processor.record import RecordResult, RecordProcessor, create_input, DefinitionInfo
+from text_processor.multirc import MultircResult, MultircProcessor, create_input, DefinitionInfo
 from dgl import save_graphs, load_graphs
-import pickle
-from nltk.corpus import wordnet as wn
-from kgs_retrieve.baseretriever import KGRetriever, read_concept_embedding, run_strip_accents
-from tqdm import tqdm
-import json
+import pandas as pd
+from sklearn.metrics import f1_score
 
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -90,8 +100,13 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
 
-    eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
+    # Note that DistributedSampler samples randomly
+    eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset, shuffle=False)
     eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+    # synset_graphs_batch = []
+    # for batch_index in eval_dataloader.batch_sampler:
+    #     synset_graphs_batch.append([i for i in batch_index])
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -99,9 +114,8 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
     if args.local_rank != -1 and not isinstance(model, torch.nn.parallel.DistributedDataParallel):
         model = torch.nn.parallel.DistributedDataParallel(
-                    model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
-                )
-
+            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+        )
 
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
@@ -114,9 +128,13 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         exit()
     else:
         # all_results = []
-        all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_unique_ids = []
+        # all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_unique_ids = []
+        all_pred = torch.tensor([], dtype=torch.long, device=args.device)
+        all_label_ids = torch.tensor([], dtype=torch.long, device=args.device)
+        all_question_ids = torch.tensor([], dtype=torch.long, device=args.device)
+
         # start_time = timeit.default_timer()
         epoch_iterator = tqdm(eval_dataloader, desc="Evaluating Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -124,74 +142,115 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
             batch = tuple(t.to(args.device) for t in batch)
             batch_synset_graphs = batch[3]
             with torch.no_grad():
-                inputs = create_input(args, batch, global_step, batch_synset_graphs=batch_synset_graphs, wn_synset_graphs=wn_synset_graphs, evaluate=True)
+                inputs = create_input(args, batch, global_step, batch_synset_graphs=batch_synset_graphs,
+                                      wn_synset_graphs=wn_synset_graphs, evaluate=True)
                 feature_indices = batch[3]
 
                 outputs = model(**inputs)
 
-            all_start_logits = torch.cat((all_start_logits, outputs[0]), dim=0)
-            all_end_logits = torch.cat((all_end_logits, outputs[1]), dim=0)
-
-            for i, feature_index in enumerate(feature_indices):
-                eval_feature = features[feature_index.item()]
-                unique_id = int(eval_feature.unique_id)
-                all_unique_ids.append(unique_id)
-
-        all_unique_ids = torch.tensor(all_unique_ids, dtype=torch.long, device=args.device)
+            logits, label_ids, qas_ids = outputs[1], outputs[2], outputs[3]
+            all_pred = torch.cat((all_pred, torch.argmax(logits, axis=-1)), dim=0)
+            all_label_ids = torch.cat((all_label_ids, label_ids), dim=0)
+            all_question_ids = torch.cat((all_question_ids, qas_ids), dim=0)
 
         start_time = timeit.default_timer()
 
-        all_start_logits_list = [torch.zeros_like(all_start_logits, device=args.device) for _ in range(torch.distributed.get_world_size())]
-        all_end_logits_list = [torch.zeros_like(all_end_logits, device=args.device) for _ in range(torch.distributed.get_world_size())]
-        all_unique_ids_list = [torch.zeros_like(all_unique_ids, device=args.device) for _ in range(torch.distributed.get_world_size())]
+        all_pred_list = [torch.zeros_like(all_pred, device=args.device) for _ in
+                                 range(torch.distributed.get_world_size())]
+        all_label_ids_list = [torch.zeros_like(all_label_ids, device=args.device) for _ in
+                               range(torch.distributed.get_world_size())]
+        all_question_ids_list = [torch.zeros_like(all_question_ids, device=args.device) for _ in
+                               range(torch.distributed.get_world_size())]
 
-        all_gather(all_start_logits_list, all_start_logits)
-        all_gather(all_end_logits_list, all_end_logits)
-        all_gather(all_unique_ids_list, all_unique_ids)
+        all_gather(all_pred_list, all_pred)
+        all_gather(all_label_ids_list, all_label_ids)
+        all_gather(all_question_ids_list, all_question_ids)
+
+        logger.info(
+            "time for gather communication:{} in rank {}".format(timeit.default_timer() - start_time, args.local_rank))
 
         if args.local_rank == 0:
-            start_time = timeit.default_timer()
             all_results = []
-            all_unique_ids_list = all_unique_ids_list
-            all_start_logits_list = all_start_logits_list
-            all_end_logits_list = all_end_logits_list
+            all_pred_list = all_pred_list
+            all_label_ids_list = all_label_ids_list
+            all_question_ids_list = all_question_ids_list
 
-            for batch_idx, batch_unique_ids in enumerate(all_unique_ids_list):
-                batch_start_logits = all_start_logits_list[batch_idx]
-                batch_end_logits = all_end_logits_list[batch_idx]
-                for i, unique_id in enumerate(batch_unique_ids):
-                    start_logits, end_logits = to_list(batch_start_logits[i]), to_list(batch_end_logits[i])
-                    result = RecordResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
+            preds = np.asarray([], dtype=int)
+            label_values = np.asarray([], dtype=int)
+            question_ids = np.asarray([], dtype=int)
+            for batch_idx, batch_preds in enumerate(all_pred_list):
+                preds = np.concatenate((preds, batch_preds.cpu().detach().numpy()), axis=0)
+                label_values = np.concatenate((label_values, all_label_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
+                question_ids = np.concatenate((question_ids, all_question_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
 
-                    all_results.append(result)
-
-            evalTime = timeit.default_timer() - start_time
-            logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
-
-            # Compute predictions
-            output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-            output_result = os.path.join(args.output_dir, "results_{}.jsonl".format(prefix))
-
-            predictions = RecordProcessor.compute_predictions_logits(
-                examples_tokenized,
-                features,
-                all_results,
-                args.n_best_size,
-                args.max_answer_length,
-                output_prediction_file,
-                output_result,
-                args.verbose_logging,
-                os.path.join(args.data_dir, args.predict_file),
-                tokenizer,
-                is_testing=args.test,
-            )
-
-            # Compute the F1 and exact scores.
             if not args.test:
-                results = RecordProcessor.record_evaluate(examples_tokenized, predictions, relate_path=args.output_dir)
-                return results
+                df = pd.DataFrame({'label_values': label_values, 'question_ids': question_ids})
+                assert "label_values" in df.columns
+                assert "question_ids" in df.columns
+                df["preds"] = preds
+                # noinspection PyUnresolvedReferences
+                exact_match = (
+                    df.groupby("question_ids")
+                        .apply(lambda _: (_["preds"] == _["label_values"]).all())
+                        .mean()
+                )
+                exact_match = float(exact_match)
+                f1 = f1_score(y_true=df["label_values"], y_pred=df["preds"])
+
+                results = {'exact_match': exact_match, 'f1': f1}
+            else:
+                results = None
+            if args.write_preds:
+                guids = []
+                for f in features:
+                    guids.append(f.guid[0])
+                guids = np.asarray(guids, dtype='<U18')
+                assert len(preds)==len(guids)
+                write_prediction(preds, guids, "multirc", args.output_dir, prefix)
+            return results
         else:
             return None
+
+def write_prediction(preds, guids, task_name, output_dir, prefix):
+    preds_dict = {}
+
+    preds_dict[task_name] = {
+        "preds": preds,
+        "guids": guids,
+    }
+    torch.save(preds_dict, os.path.join(output_dir, prefix+"_test_preds.p"))
+    formatted_preds = convert_superglue_submission(preds_dict[task_name])
+    write_jsonl(data=formatted_preds, path=os.path.join("../outputs/", prefix+"_MultiRC.jsonl"))
+
+def convert_superglue_submission(pred_dict):
+    lines = []
+    # formatting code adapted from: https://github.com/nyu-mll/jiant/blob/
+    # 14fae87d2ebc5a45dbe7254e9007d1a148dd6b18/jiant/evaluate.py#L427
+    par_qst_ans_d = collections.defaultdict(lambda: collections.defaultdict(list))
+    for pred, guid in zip(list(pred_dict["preds"]), list(pred_dict["guids"])):
+        passage_id, question_id, answer_id = [int(i) for i in guid.split("-")[1:]]
+        ans_d = {"idx": answer_id, "label": int(pred)}
+        par_qst_ans_d[passage_id][question_id].append(ans_d)
+    for par_idx, qst_ans_d in par_qst_ans_d.items():
+        qst_ds = []
+        for qst_idx, answers in qst_ans_d.items():
+            qst_d = {"idx": qst_idx, "answers": answers}
+            qst_ds.append(qst_d)
+        out_d = {"idx": par_idx, "passage": {"questions": qst_ds}}
+        lines.append(out_d)
+    return lines
+
+def write_jsonl(data, path):
+    assert isinstance(data, list)
+    lines = [to_jsonl(elem) for elem in data]
+    write_file("\n".join(lines), path)
+
+def to_jsonl(data):
+    return json.dumps(data).replace("\n", "")
+
+def write_file(data, path, mode="w", **kwargs):
+    with open(path, mode=mode, **kwargs) as f:
+        f.write(data)
 
 def load_and_cache_examples(args, processor, retrievers, relation_list, input_dir, evaluate=False, output_examples=False):
     """
@@ -232,12 +291,10 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
             features_and_dataset["dataset"],
             features_and_dataset["examples"],
         )
-
         if args.model_type == "kelm":
             all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
         else:
             all_kgs_graphs, all_kgs_graphs_label_dict = [], []
-
     else:
         logger.error("dataset not exist and program exits")
         exit()
@@ -395,9 +452,10 @@ def main():
 
     model_g = ArgumentGroup(parser, "model", "model configuration and path.")
 
-    model_g.add_arg("dataset", str, "record", "used dataset")
+    model_g.add_arg("dataset", str, "multirc", "used dataset")
+    model_g.add_arg("write_preds", bool, True, "weather write_preds")
     model_g.add_arg("is_update_max_concept", bool, True, "weather update max concept for kg retriver")
-    model_g.add_arg("full_table", bool, True, "full_table")
+    model_g.add_arg("full_table", bool, False, "full_table")
     model_g.add_arg("test", bool, False, "weather load superglue test set")
     model_g.add_arg("use_wn", bool, True, "wn")
     model_g.add_arg("use_nell", bool, True, "nell")
@@ -408,9 +466,8 @@ def main():
     model_g.add_arg("memory_bank_keep_coef", float, 0.0, "what percent keep")
     model_g.add_arg("use_context_graph", bool, True, "use_context_graph")
 
-
     model_g.add_arg("schedule_strategy", str, "linear", "schedule_strategy")
-    model_g.add_arg("tokenizer_path", str, "", "tokenizer_path")
+    model_g.add_arg("tokenizer_path", str, "../cache/bert-large-cased/", "tokenizer_path")
     model_g.add_arg("save_model", bool, True, "whether save model")
     model_g.add_arg("data_preprocess", bool, False, "data process")
     model_g.add_arg("data_preprocess_evaluate", bool, False, "data_preprocess_evaluate")
@@ -425,13 +482,15 @@ def main():
     model_g.add_arg("fewer_label", bool, False, "weather fewer_label")
     model_g.add_arg("label_rate", float, 0.1, "label rate")
 
-    model_g.add_arg("relation_list", list, ["_hyponym", "_hypernym", "_derivationally_related_form", "_member_meronym", "_member_holonym",
+    model_g.add_arg("relation_list", list,
+                    ["_hyponym", "_hypernym", "_derivationally_related_form", "_member_meronym", "_member_holonym",
                      "_part_of", "_has_part", "_member_of_domain_topic", "_synset_domain_topic_of", "_instance_hyponym",
                      "_instance_hypernym", "_also_see", "_verb_group", "_member_of_domain_region",
-                     "_synset_domain_region_of", "_member_of_domain_usage", "_synset_domain_usage_of", "_similar_to"], "The used relation.")
-    model_g.add_arg("is_all_relation", bool, True, "use all relations")
+                     "_synset_domain_region_of", "_member_of_domain_usage", "_synset_domain_usage_of", "_similar_to"],
+                    "The used relation.")
+    model_g.add_arg("is_all_relation", bool, False, "use all relations")
     model_g.add_arg("selected_relation", str, "_hyponym,_hypernym,_derivationally_related_form", "relations")
-    model_g.add_arg("wn18_dir", str, "", "wn18 dir")
+    model_g.add_arg("wn18_dir", str, "../data/kgs/wn18/text/", "wn18 dir")
 
     # SSL part
     model_g.add_arg("use_consistent_loss_wn", bool, False, "add consistent loss between entity embedding from WN.")
@@ -442,11 +501,11 @@ def main():
     model_g.add_arg("tensorboard_dir", str, "./", "tensorboard_dir")
     model_g.add_arg("debug", bool, False, "debug")
 
-
-    model_g.add_arg("model_name_or_path", str, "", "Path to pretrained model or model identifier from huggingface.co/models")
-    model_g.add_arg("config_name", str, "", "Pretrained config name or path if not the same as model_name")
+    model_g.add_arg("model_name_or_path", str, "../cache/bert-large-cased/",
+                    "Path to pretrained model or model identifier from huggingface.co/models")
+    model_g.add_arg("config_name", str, "../cache/bert-large-cased/", "Pretrained config name or path if not the same as model_name")
     model_g.add_arg("model_type", str, "kelm", "The classification model to be used.")
-    model_g.add_arg("text_embed_model", str, "bert", "The model for embedding texts in KELM model.")
+    model_g.add_arg("text_embed_model", str, "bert", "The model for embedding texts in kelm model.")
     model_g.add_arg("output_dir", str, "../outputs/test", "Path to save checkpoints.")
     model_g.add_arg("overwrite_output_dir", bool, True, "Overwrite the content of the output directory.")
     model_g.add_arg(
@@ -457,8 +516,10 @@ def main():
     )
     model_g.add_arg("per_gpu_train_batch_size", int, 6, "Batch size per GPU/CPU for training.")
     model_g.add_arg("per_gpu_eval_batch_size", int, 4, "Batch size per GPU/CPU for evaluation.")
-    model_g.add_arg("max_steps", int, -1, "If > 0: set total number of training steps to perform. Override num_train_epochs.")
-    model_g.add_arg("gradient_accumulation_steps", int, 1, "Number of updates steps to accumulate before performing a backward/update pass.")
+    model_g.add_arg("max_steps", int, -1,
+                    "If > 0: set total number of training steps to perform. Override num_train_epochs.")
+    model_g.add_arg("gradient_accumulation_steps", int, 1,
+                    "Number of updates steps to accumulate before performing a backward/update pass.")
     model_g.add_arg("num_train_epochs", float, 10, "Total number of training epochs to perform.")
     model_g.add_arg("weight_decay", float, 0.01, "Weight decay if we apply some.")
     model_g.add_arg("learning_rate", float, 3e-4, "The initial learning rate for Adam.")
@@ -472,9 +533,10 @@ def main():
     model_g.add_arg("evaluate_during_training", bool, True, "Run evaluation during training at each logging step.")
     model_g.add_arg("n_best_size", int, 20,
                     "The total number of n-best predictions to generate in the nbest_predictions.json output file.")
-    model_g.add_arg("verbose_logging", bool, False, "If true, all of the warnings related to data processing will be printed. "
-        "A number of warnings are expected for a normal SQuAD evaluation.")
-    model_g.add_arg("init_dir", str, "", "The path of loading pre-trained model.")
+    model_g.add_arg("verbose_logging", bool, False,
+                    "If true, all of the warnings related to data processing will be printed. "
+                    "A number of warnings are expected for a normal multirc evaluation.")
+    model_g.add_arg("init_dir", str, "../cache/bert-large-cased/", "The path of loading pre-trained model.")
     model_g.add_arg("initializer_range", float, 0.02, "The initializer range for KELM")
     model_g.add_arg("cat_mul", bool, True, "The output part of vector in KELM")
     model_g.add_arg("cat_sub", bool, True, "The output part of vector in KELM")
@@ -483,29 +545,29 @@ def main():
     model_g.add_arg("cat_twotime_sub", bool, False, "The output part of vector in KELM")
 
     data_g = ArgumentGroup(parser, "data", "Data paths, vocab paths and data processing options")
-    data_g.add_arg("train_file", str, "record/train_0831.json", "ReCoRD json for training. E.g., train.json.")
-    data_g.add_arg("predict_file", str, "record/dev_0831.json", "ReCoRD json for predictions. E.g. dev.json.")
+    data_g.add_arg("train_file", str, "multirc/train.tagged.jsonl", "multirc json for training. E.g., train.json.")
+    data_g.add_arg("predict_file", str, "multirc/val.tagged.jsonl", "multirc json for predictions. E.g. dev.json.")
     data_g.add_arg("cache_file_suffix", str, "test", "The suffix of cached file.")
-    data_g.add_arg("cache_dir", str, "", "The cached data path.")
-    data_g.add_arg("cache_store_dir", str, "", "The cached data path.")
-    data_g.add_arg("data_dir", str, "", "The input data dir. Should contain the .json files for the task."
+    data_g.add_arg("cache_dir", str, "../cache/", "The cached data path.")
+    data_g.add_arg("cache_store_dir", str, "../cache/", "The cached data path.")
+    data_g.add_arg("data_dir", str, "../data/", "The input data dir. Should contain the .json files for the task."
                    + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.")
 
     data_g.add_arg("vocab_path", str, "vocab.txt", "Vocabulary path.")
     data_g.add_arg("do_lower_case", bool, False,
                    "Whether to lower case the input text. Should be True for uncased models and False for cased models.")
     data_g.add_arg("seed", int, 42, "Random seed.")
-    data_g.add_arg("kg_paths", dict, {"wordnet":"kgs/", "nell": "kgs/"}, "The paths of knowledge graph files.")
+    data_g.add_arg("kg_paths", dict, {"wordnet": "kgs/", "nell": "kgs/"}, "The paths of knowledge graph files.")
     data_g.add_arg("wn_concept_embedding_path", str, "embedded/wn_concept2vec.txt",
                    "The embeddings of concept in knowledge graph : Wordnet.")
     data_g.add_arg("nell_concept_embedding_path", str, "embedded/nell_concept2vec.txt",
                    "The embeddings of concept in knowledge graph : Nell.")
     data_g.add_arg("use_kgs", list, ['nell', 'wordnet'], "The used knowledge graphs.")
-    data_g.add_arg("doc_stride", int, 128,
-                   "When splitting up a long document into chunks, how much stride to take between chunks.")
-    data_g.add_arg("max_seq_length", int, 384, "Number of words of the longest seqence.")
-    data_g.add_arg("max_query_length", int, 64, "Max query length.")
-    data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
+    # data_g.add_arg("doc_stride", int, 128,
+    #                "When splitting up a long document into chunks, how much stride to take between chunks.")
+    data_g.add_arg("max_seq_length", int, 256, "Number of words of the longest seqence.")
+    # data_g.add_arg("max_query_length", int, 64, "Max query length.")
+    # data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
     data_g.add_arg("no_stopwords", bool, True, "Whether to include stopwords.")
     data_g.add_arg("ignore_length", int, 0, "The smallest size of token.")
     data_g.add_arg("print_loss_step", int, 100, "The steps to print loss.")
@@ -527,7 +589,8 @@ def main():
     run_type_g.add_arg("local_rank", int, -1, "Index for distributed training on gpus.")
     run_type_g.add_arg("threads", int, 50, "multiple threads for converting example to features")
     run_type_g.add_arg("overwrite_cache", bool, False, "Overwrite the cached training and evaluation sets")
-    run_type_g.add_arg("eval_all_checkpoints", bool, False, "Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
+    run_type_g.add_arg("eval_all_checkpoints", bool, False,
+                       "Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     run_type_g.add_arg("min_diff_steps", int, 50, "The minimum saving steps before the last maximum steps.")
     args = parser.parse_args()
 
@@ -537,12 +600,12 @@ def main():
         args.relation_list = args.selected_relation.split(",")
         logger.info("not use all relation, relation_list: {}".format(args.relation_list))
 
-    if args.doc_stride >= args.max_seq_length - args.max_query_length:
-        logger.warning(
-            "WARNING - You've set a doc stride which may be superior to the document length in some "
-            "examples. This could result in errors when building features from the examples. Please reduce the doc "
-            "stride or increase the maximum length to ensure the features are correctly built."
-        )
+    # if args.doc_stride >= args.max_seq_length - args.max_query_length:
+    #     logger.warning(
+    #         "WARNING - You've set a doc stride which may be superior to the document length in some "
+    #         "examples. This could result in errors when building features from the examples. Please reduce the doc "
+    #         "stride or increase the maximum length to ensure the features are correctly built."
+    #     )
 
 
     if (
@@ -611,7 +674,7 @@ def main():
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-    processor = RecordProcessor(args)
+    processor = MultircProcessor(args)
 
     input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}".format(
             args.model_type,

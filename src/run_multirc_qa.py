@@ -42,8 +42,10 @@ from transformers import (
 from model.model_utils import configure_tokenizer_model
 from kgs_retrieve.kg_utils import initialize_kg_retriever
 from utils.args import ArgumentGroup
-from text_processor.record import RecordResult, RecordProcessor, create_input, DefinitionInfo
+from text_processor.multirc import MultircResult, MultircProcessor, create_input, DefinitionInfo
 from dgl import save_graphs, load_graphs
+import pandas as pd
+from sklearn.metrics import f1_score
 
 import resource
 
@@ -234,22 +236,11 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 outputs = model(**inputs)
                 # model outputs are always tuple in transformers (see doc)
                 loss = outputs[0]
-                if args.model_type in ["bert", "roberta", "roberta_base"]:
-                    loss_dic = {
-                        'loss_wn': torch.tensor(0.0, device=args.device),
-                        'loss_cls': torch.tensor(0.0, device=args.device),
-                    }
-                else:
-                    loss_dic = outputs[3]
 
                 if args.n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
-                    for k in loss_dic.keys():
-                        loss_dic[k] = loss_dic[k].mean()
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
-                    for k in loss_dic.keys():
-                        loss_dic[k] = loss_dic[k] / args.gradient_accumulation_steps
 
                 if args.use_fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -257,27 +248,19 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                 else:
                     loss.backward()
 
-                return loss.detach(), loss_dic
+                return loss.detach()
 
             if (step + 1) % args.gradient_accumulation_steps != 0:
                 with model.no_sync():
-                    loss, loss_dic = training_step(batch)
+                    loss = training_step(batch)
             else:
-                loss, loss_dic = training_step(batch)
+                loss = training_step(batch)
 
             tr_loss += loss.item()
             if args.local_rank in [-1, 0] and (step + 1) % args.gradient_accumulation_steps == 0:
                 logger.info('total loss during training {} at {}'.format(loss.item(), global_step))
 
-            for k, v in loss_dic.items():
-                if k not in tr_loss_dic:
-                    tr_loss_dic[k] = 0.0
-                if k not in logging_loss_dic:
-                    logging_loss_dic[k] = 0.0
-                tr_loss_dic[k] += v.item()
-
             if (step + 1) % args.gradient_accumulation_steps == 0:
-
                 if args.local_rank in [-1, 0] and global_step == 1:
                     tb_writer.add_scalar("loss", tr_loss, int(global_step * all_train_size / 24))
 
@@ -301,7 +284,10 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                     results = evaluate(args, model, processor, tokenizer, global_step, input_dir)
 
                     if args.local_rank in [-1, 0]:
+                        total_score = 0
+                        is_saved = True
                         for key, value in results.items():
+                            total_score += value
                             logger.info("eval_{}. Value: {}. In Step: {}".format(key, value, global_step))
                             if args.mark != "test":
                                 tb_writer.add_scalar("eval_{}".format(key), value,
@@ -311,7 +297,7 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                             elif value > best_evals[key][0]:
                                 if global_step - best_evals[key][1] > args.min_diff_steps and args.save_model:
                                     logger.info(
-                                        "Saving the model since {} is improved from {} to {} at step {}".format(key,
+                                        "notice the model since {} is improved from {} to {} at step {}".format(key,
                                                                                                                 best_evals[
                                                                                                                     key][
                                                                                                                     0],
@@ -319,23 +305,50 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                                                                                                                 global_step))
                                     # Save model checkpoint
                                     try:
-                                        output_dir = os.path.join(args.output_dir,
-                                                                  "checkpoint-{}".format(global_step))
-                                        if not os.path.exists(output_dir):
-                                            os.mkdir(output_dir)
+                                        if is_saved:
+                                            output_dir = os.path.join(args.output_dir,
+                                                                      "checkpoint-{}".format(global_step))
+                                            if not os.path.exists(output_dir):
+                                                os.mkdir(output_dir)
+                                            logger.info("saving model ...")
+                                            # Take care of distributed/parallel training
+                                            model_to_save = model.module if hasattr(model, "module") else model
+                                            model_to_save.save_pretrained(output_dir)
 
-                                        # Take care of distributed/parallel training
-                                        model_to_save = model.module if hasattr(model, "module") else model
-                                        model_to_save.save_pretrained(output_dir)
-
-                                        torch.save(args, os.path.join(output_dir, "training_args.bin"))
-                                        torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                                        torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                                        logger.info("Saving arguments, optimizer and scheduler states to %s",
-                                                    output_dir)
+                                            torch.save(args, os.path.join(output_dir, "training_args.bin"))
+                                            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                                            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                                            logger.info("Saving arguments, optimizer and scheduler states to %s",
+                                                        output_dir)
+                                            is_saved = False
                                     except:
                                         logger.warning("Cannot save the checkpoints.")
                                     best_evals[key] = (value, global_step)
+                        if "total_score" not in best_evals:
+                            best_evals["total_score"] = (total_score, global_step)
+                        elif total_score > best_evals["total_score"][0]:
+                            best_evals["total_score"] = (total_score, global_step)
+                            logger.info("best em+f1 score: {} at step {}".format(total_score, global_step))
+                            if is_saved:
+                                try:
+                                    output_dir = os.path.join(args.output_dir,
+                                                              "checkpoint-{}".format(global_step))
+                                    if not os.path.exists(output_dir):
+                                        os.mkdir(output_dir)
+                                    logger.info("saving model ...")
+                                    # Take care of distributed/parallel training
+                                    model_to_save = model.module if hasattr(model, "module") else model
+                                    model_to_save.save_pretrained(output_dir)
+
+                                    torch.save(args, os.path.join(output_dir, "training_args.bin"))
+                                    torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                                    torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                                    logger.info("Saving arguments, optimizer and scheduler states to %s",
+                                                output_dir)
+                                except:
+                                    logger.warning("Cannot save the checkpoints.")
+
+                        logger.info("em+f1 score: {}".format(total_score))
                         # # except:
                         # logger.info("To be processed Error for evaluate within train.")
 
@@ -344,13 +357,8 @@ def train(args, train_dataset, model, processor, tokenizer, retrievers, wn_synse
                         tb_writer.add_scalar("lr", scheduler.get_lr()[0], int(global_step * all_train_size / 24))
                         tb_writer.add_scalar("loss", (tr_loss - logging_loss) / train_loss_record_steps,
                                              int(global_step * all_train_size / 24))
-                        for k, v in tr_loss_dic.items():
-                            tb_writer.add_scalar(f'loss/{k}', (v - logging_loss_dic[k]) / train_loss_record_steps,
-                                                 int(global_step * all_train_size / 24))
 
                     logging_loss = tr_loss
-                    for k, v in tr_loss_dic.items():
-                        logging_loss_dic[k] = v
 
                 # if args.memory_bank_update and args.use_context_graph and global_step % args.memory_bank_update_steps == 0:
                 #     model.eval()
@@ -507,9 +515,13 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         exit()
     else:
         # all_results = []
-        all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
-        all_unique_ids = []
+        # all_start_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_end_logits = torch.tensor([], dtype=torch.float32, device=args.device)
+        # all_unique_ids = []
+        all_pred = torch.tensor([], dtype=torch.long, device=args.device)
+        all_label_ids = torch.tensor([], dtype=torch.long, device=args.device)
+        all_question_ids = torch.tensor([], dtype=torch.long, device=args.device)
+        all_logits = torch.tensor([], dtype=torch.float, device=args.device)
         # start_time = timeit.default_timer()
         epoch_iterator = tqdm(eval_dataloader, desc="Evaluating Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -523,28 +535,27 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
 
                 outputs = model(**inputs)
 
-            all_start_logits = torch.cat((all_start_logits, outputs[0]), dim=0)
-            all_end_logits = torch.cat((all_end_logits, outputs[1]), dim=0)
-
-            for i, feature_index in enumerate(feature_indices):
-                eval_feature = features[feature_index.item()]
-                unique_id = int(eval_feature.unique_id)
-                all_unique_ids.append(unique_id)
-
-        all_unique_ids = torch.tensor(all_unique_ids, dtype=torch.long, device=args.device)
+            logits, label_ids, qas_ids = outputs[1], outputs[2], outputs[3]
+            all_pred = torch.cat((all_pred, torch.argmax(logits, axis=-1)), dim=0)
+            all_label_ids = torch.cat((all_label_ids, label_ids), dim=0)
+            all_question_ids = torch.cat((all_question_ids, qas_ids), dim=0)
+            all_logits = torch.cat((all_logits, logits), dim=0)
 
         start_time = timeit.default_timer()
 
-        all_start_logits_list = [torch.zeros_like(all_start_logits, device=args.device) for _ in
+        all_pred_list = [torch.zeros_like(all_pred, device=args.device) for _ in
                                  range(torch.distributed.get_world_size())]
-        all_end_logits_list = [torch.zeros_like(all_end_logits, device=args.device) for _ in
+        all_label_ids_list = [torch.zeros_like(all_label_ids, device=args.device) for _ in
                                range(torch.distributed.get_world_size())]
-        all_unique_ids_list = [torch.zeros_like(all_unique_ids, device=args.device) for _ in
+        all_question_ids_list = [torch.zeros_like(all_question_ids, device=args.device) for _ in
+                               range(torch.distributed.get_world_size())]
+        all_logits_list = [torch.zeros_like(all_logits, device=args.device) for _ in
                                range(torch.distributed.get_world_size())]
 
-        all_gather(all_start_logits_list, all_start_logits)
-        all_gather(all_end_logits_list, all_end_logits)
-        all_gather(all_unique_ids_list, all_unique_ids)
+        all_gather(all_pred_list, all_pred)
+        all_gather(all_label_ids_list, all_label_ids)
+        all_gather(all_question_ids_list, all_question_ids)
+        all_gather(all_logits_list, all_logits)
 
         logger.info(
             "time for gather communication:{} in rank {}".format(timeit.default_timer() - start_time, args.local_rank))
@@ -552,43 +563,39 @@ def evaluate(args, model, processor, tokenizer, global_step, input_dir, prefix="
         if args.local_rank == 0:
             start_time = timeit.default_timer()
             all_results = []
-            all_unique_ids_list = all_unique_ids_list
-            all_start_logits_list = all_start_logits_list
-            all_end_logits_list = all_end_logits_list
+            all_pred_list = all_pred_list
+            all_label_ids_list = all_label_ids_list
+            all_question_ids_list = all_question_ids_list
+            all_logits_list = all_logits_list
 
-            for batch_idx, batch_unique_ids in enumerate(all_unique_ids_list):
-                batch_start_logits = all_start_logits_list[batch_idx]
-                batch_end_logits = all_end_logits_list[batch_idx]
-                for i, unique_id in enumerate(batch_unique_ids):
-                    # output = [to_list(output[i]) for output in batch_logits]
-                    start_logits, end_logits = to_list(batch_start_logits[i]), to_list(batch_end_logits[i])
-                    result = RecordResult(int(unique_id.cpu().numpy()), start_logits, end_logits)
+            logger.info("all_logits_list\n{}".format(all_logits_list))
+            logger.info("all_question_ids_list\n{}".format(all_question_ids_list))
+            logger.info("all_label_ids_list\n{}".format(all_label_ids_list))
+            logger.info("all_pred_list\n{}".format(all_pred_list))
 
-                    all_results.append(result)
 
-            evalTime = timeit.default_timer() - start_time
-            logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
+            preds = np.asarray([], dtype=int)
+            label_values = np.asarray([], dtype=int)
+            question_ids = np.asarray([], dtype=int)
+            for batch_idx, batch_preds in enumerate(all_pred_list):
+                preds = np.concatenate((preds, batch_preds.cpu().detach().numpy()), axis=0)
+                label_values = np.concatenate((label_values, all_label_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
+                question_ids = np.concatenate((question_ids, all_question_ids_list[batch_idx].cpu().detach().numpy()), axis=0)
 
-            # Compute predictions
-            output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-            output_result = os.path.join(args.output_dir, "results_{}.jsonl".format(prefix))
-
-            predictions = RecordProcessor.compute_predictions_logits(
-                examples_tokenized,
-                features,
-                all_results,
-                args.n_best_size,
-                args.max_answer_length,
-                output_prediction_file,
-                output_result,
-                args.verbose_logging,
-                os.path.join(args.data_dir, args.predict_file),
-                tokenizer,
-                is_testing=args.test,
+            df = pd.DataFrame({'label_values': label_values, 'question_ids': question_ids})
+            assert "label_values" in df.columns
+            assert "question_ids" in df.columns
+            df["preds"] = preds
+            # noinspection PyUnresolvedReferences
+            exact_match = (
+                df.groupby("question_ids")
+                    .apply(lambda _: (_["preds"] == _["label_values"]).all())
+                    .mean()
             )
+            exact_match = float(exact_match)
+            f1 = f1_score(y_true=df["label_values"], y_pred=df["preds"])
 
-            # Compute the F1 and exact scores.
-            results = RecordProcessor.record_evaluate(examples_tokenized, predictions, relate_path=args.output_dir)
+            results = {'exact_match': exact_match, 'f1': f1}
             return results
         else:
             return None
@@ -628,8 +635,10 @@ def load_and_cache_examples(args, processor, retrievers, relation_list, input_di
             features_and_dataset["dataset"],
             features_and_dataset["examples"],
         )
-
-        all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
+        if args.model_type == "kelm":
+            all_kgs_graphs, all_kgs_graphs_label_dict = load_graphs(cached_features_file + "_all_kgs_graphs.bin")
+        else:
+            all_kgs_graphs, all_kgs_graphs_label_dict = [], []
     else:
         logger.error("dataset not exist and program exits")
         exit()
@@ -675,6 +684,7 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
 
         logger.info("Creating features from dataset file at %s", input_dir)
 
+        # if not os.path.exists("../tmp/examples_tokenized"):
         examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
 
         examples_tokenized = processor.tokenization_on_examples(examples, tokenizer, is_testing=args.test)
@@ -687,8 +697,9 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+            if args.model_type == "kelm":
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
             logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
@@ -745,8 +756,9 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
             is_training=not evaluate, debug=args.debug)
 
         if args.local_rank in [-1, 0]:
-            all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
-            save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
+            if args.model_type == "kelm":
+                all_kgs_graphs_label_dict = {"glabel": torch.tensor([i for i in range(len(all_kgs_graphs))])}
+                save_graphs(cached_features_file + "_all_kgs_graphs.bin", all_kgs_graphs, all_kgs_graphs_label_dict)
             logger.info("complete data preprocessing")
 
             logger.info("Saving features into cached file %s", cached_features_file)
@@ -755,42 +767,46 @@ def create_dataset(args, processor, retrievers, relation_list, evaluate, input_d
                 del f.kgs_conceptids2synset
             torch.save({"features": features, "dataset": dataset, "examples": examples_tokenized}, cached_features_file)
 
-            logger.info("saving definition embedding")
+            if args.model_type == "kelm":
+                logger.info("saving definition embedding")
 
-            t_list = tokenizer(definition_info.defid2def, return_tensors="pt", padding=True)
+                t_list = tokenizer(definition_info.defid2def, return_tensors="pt", padding=True)
 
-            t_list_input_ids = t_list["input_ids"].to(encoder.device)
-            if args.text_embed_model == "bert":
-                t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
-            t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
-
-            defid2defembed = torch.Tensor()
-            c_size = 1024
-            start_point = 0
-            end_point = start_point + c_size
-            total_size = len(t_list_input_ids)
-            while True:
-                if start_point > total_size:
-                    break
-                if end_point > total_size:
-                    end_point = total_size
-
+                t_list_input_ids = t_list["input_ids"].to(encoder.device)
                 if args.text_embed_model == "bert":
-                    tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                  token_type_ids=t_list_token_type_ids[start_point:end_point, :],
-                                  attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
-                elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
-                    tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
-                                  attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
-                else:
-                    logger.warning("not available LM, exit program")
-                    exit()
-                defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
+                    t_list_token_type_ids = t_list["token_type_ids"].to(encoder.device)
+                t_list_attention_mask = t_list["attention_mask"].to(encoder.device)
 
-                start_point += c_size
-                end_point += c_size
+                defid2defembed = torch.Tensor()
+                c_size = 1024
+                start_point = 0
+                end_point = start_point + c_size
+                total_size = len(t_list_input_ids)
+                while True:
+                    if start_point > total_size:
+                        break
+                    if end_point > total_size:
+                        end_point = total_size
 
-            assert defid2defembed.shape[0] == total_size
+                    if args.text_embed_model == "bert":
+                        tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+                                      token_type_ids=t_list_token_type_ids[start_point:end_point, :],
+                                      attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
+                    elif args.text_embed_model == "roberta" or args.text_embed_model == "roberta_base":
+                        tmp = encoder(input_ids=t_list_input_ids[start_point:end_point, :],
+                                      attention_mask=t_list_attention_mask[start_point:end_point, :])[1].cpu()
+                    else:
+                        logger.warning("not available LM, exit program")
+                        exit()
+                    defid2defembed = torch.cat([defid2defembed, tmp], dim=0)
+
+                    start_point += c_size
+                    end_point += c_size
+
+                assert defid2defembed.shape[0] == total_size
+            else:
+                defid2defembed = []
+                t_list = []
 
 
             logger.info("Saving knowledge graph retrievers")
@@ -821,7 +837,7 @@ def main():
 
     model_g = ArgumentGroup(parser, "model", "model configuration and path.")
 
-    model_g.add_arg("dataset", str, "record", "used dataset")
+    model_g.add_arg("dataset", str, "multirc", "used dataset")
     model_g.add_arg("is_update_max_concept", bool, False, "weather update max concept for kg retriver")
     model_g.add_arg("full_table", bool, False, "full_table")
     model_g.add_arg("test", bool, False, "weather load superglue test set")
@@ -903,7 +919,7 @@ def main():
                     "The total number of n-best predictions to generate in the nbest_predictions.json output file.")
     model_g.add_arg("verbose_logging", bool, False,
                     "If true, all of the warnings related to data processing will be printed. "
-                    "A number of warnings are expected for a normal SQuAD evaluation.")
+                    "A number of warnings are expected for a normal multirc evaluation.")
     model_g.add_arg("init_dir", str, "../cache/bert-large-cased/", "The path of loading pre-trained model.")
     model_g.add_arg("initializer_range", float, 0.02, "The initializer range for KELM")
     model_g.add_arg("cat_mul", bool, True, "The output part of vector in KELM")
@@ -913,8 +929,8 @@ def main():
     model_g.add_arg("cat_twotime_sub", bool, False, "The output part of vector in KELM")
 
     data_g = ArgumentGroup(parser, "data", "Data paths, vocab paths and data processing options")
-    data_g.add_arg("train_file", str, "record/train.json", "ReCoRD json for training. E.g., train.json.")
-    data_g.add_arg("predict_file", str, "record/dev.json", "ReCoRD json for predictions. E.g. dev.json.")
+    data_g.add_arg("train_file", str, "multirc/train.tagged.jsonl", "multirc json for training. E.g., train.json.")
+    data_g.add_arg("predict_file", str, "multirc/val.tagged.jsonl", "multirc json for predictions. E.g. dev.json.")
     data_g.add_arg("cache_file_suffix", str, "test", "The suffix of cached file.")
     data_g.add_arg("cache_dir", str, "../cache/", "The cached data path.")
     data_g.add_arg("cache_store_dir", str, "../cache/", "The cached data path.")
@@ -931,11 +947,11 @@ def main():
     data_g.add_arg("nell_concept_embedding_path", str, "embedded/nell_concept2vec.txt",
                    "The embeddings of concept in knowledge graph : Nell.")
     data_g.add_arg("use_kgs", list, ['nell', 'wordnet'], "The used knowledge graphs.")
-    data_g.add_arg("doc_stride", int, 128,
-                   "When splitting up a long document into chunks, how much stride to take between chunks.")
-    data_g.add_arg("max_seq_length", int, 384, "Number of words of the longest seqence.")
-    data_g.add_arg("max_query_length", int, 64, "Max query length.")
-    data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
+    # data_g.add_arg("doc_stride", int, 128,
+    #                "When splitting up a long document into chunks, how much stride to take between chunks.")
+    data_g.add_arg("max_seq_length", int, 256, "Number of words of the longest seqence.")
+    # data_g.add_arg("max_query_length", int, 64, "Max query length.")
+    # data_g.add_arg("max_answer_length", int, 30, "Max answer length.")
     data_g.add_arg("no_stopwords", bool, True, "Whether to include stopwords.")
     data_g.add_arg("ignore_length", int, 0, "The smallest size of token.")
     data_g.add_arg("print_loss_step", int, 100, "The steps to print loss.")
@@ -968,12 +984,12 @@ def main():
         args.relation_list = args.selected_relation.split(",")
         logger.info("not use all relation, relation_list: {}".format(args.relation_list))
 
-    if args.doc_stride >= args.max_seq_length - args.max_query_length:
-        logger.warning(
-            "WARNING - You've set a doc stride which may be superior to the document length in some "
-            "examples. This could result in errors when building features from the examples. Please reduce the doc "
-            "stride or increase the maximum length to ensure the features are correctly built."
-        )
+    # if args.doc_stride >= args.max_seq_length - args.max_query_length:
+    #     logger.warning(
+    #         "WARNING - You've set a doc stride which may be superior to the document length in some "
+    #         "examples. This could result in errors when building features from the examples. Please reduce the doc "
+    #         "stride or increase the maximum length to ensure the features are correctly built."
+    #     )
 
     if (
             os.path.exists(args.output_dir)
@@ -1041,7 +1057,7 @@ def main():
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
-    processor = RecordProcessor(args)
+    processor = MultircProcessor(args)
 
     input_dir = os.path.join(args.cache_store_dir, "cached_{}_{}".format(
         args.model_type,

@@ -23,9 +23,6 @@ WEIGHTS_NAME = "pytorch_model.bin"
 MODEL_NAME = "model.pkl"
 logger = logging.getLogger(__name__)
 
-BertLayerNorm = nn.LayerNorm
-
-
 class KELMConfig(PretrainedConfig):
     def __init__(
             self,
@@ -231,17 +228,17 @@ class SelfMatching(nn.Module):
         res = res + self.bias
         return res
 
-    def forward(self, input, attention_mask):
+    def forward(self, input_batch, attention_mask):
         """
-        :param input: shape [batch_size, seq_size, input_size]
+        :param input_batch: shape [batch_size, seq_size, input_size]
         :param attention_mask: shape [batch_size, seq_size, 1]
         :return:
         """
-        assert len(input.shape) == 3 and len(attention_mask.shape) == 3 \
+        assert len(input_batch.shape) == 3 and len(attention_mask.shape) == 3 \
                and attention_mask.shape[-1] == 1
-        assert input.shape[:2] == attention_mask.shape[:2]
+        assert input_batch.shape[:2] == attention_mask.shape[:2]
 
-        sim_score = self.trilinear_for_attention(input)
+        sim_score = self.trilinear_for_attention(input_batch)
 
         softmax_mask = (1 - attention_mask) * self.very_large_value  # [batch_size, seq_size, 1]
         # softmax_mask = softmax_mask.float().transpose(1,2).expand((*softmax_mask.shape[:2],softmax_mask.shape[1]))
@@ -250,23 +247,23 @@ class SelfMatching(nn.Module):
         sim_score = sim_score + softmax_mask
 
         attn_prob = F.softmax(sim_score, dim=2)  # [batch_size, seq_size, seq_size]
-        weighted_sum = torch.matmul(attn_prob, input)  # [batch_size, seq_size, input_size]
+        weighted_sum = torch.matmul(attn_prob, input_batch)  # [batch_size, seq_size, input_size]
 
         if any([self.cat_twotime_mul, self.cat_twotime, self.cat_twotime_sub]):
             twotime_att_prob = torch.matmul(attn_prob, attn_prob)
-            twotime_weighted_sum = torch.matmul(twotime_att_prob, input)
+            twotime_weighted_sum = torch.matmul(twotime_att_prob, input_batch)
 
-        out_tensors = torch.cat((input, weighted_sum), dim=2)
+        out_tensors = torch.cat((input_batch, weighted_sum), dim=2)
         if self.cat_mul:
-            out_tensors = torch.cat((out_tensors, torch.mul(input, weighted_sum)), dim=2)
+            out_tensors = torch.cat((out_tensors, torch.mul(input_batch, weighted_sum)), dim=2)
         if self.cat_sub:
-            out_tensors = torch.cat((out_tensors, input - weighted_sum), dim=2)
+            out_tensors = torch.cat((out_tensors, input_batch - weighted_sum), dim=2)
         if self.cat_twotime:
             out_tensors = torch.cat((out_tensors, twotime_weighted_sum), dim=2)
         if self.cat_twotime_mul:
-            out_tensors = torch.cat((out_tensors, torch.mul(input, twotime_weighted_sum)), dim=2)
+            out_tensors = torch.cat((out_tensors, torch.mul(input_batch, twotime_weighted_sum)), dim=2)
         if self.cat_twotime_sub:
-            out_tensors = torch.cat((out_tensors, input - twotime_weighted_sum), dim=2)
+            out_tensors = torch.cat((out_tensors, input_batch - twotime_weighted_sum), dim=2)
 
         return out_tensors
 
@@ -366,7 +363,7 @@ class KELM(nn.Module):
                                                )
 
         # self.graph_qa_kt_outputs = nn.Linear(2*(self.bert_embedding_size+self.concept_embed_size), 2)
-        self.qa_kt_outputs = nn.Linear(self.output_length, 2)
+        self.qa_kt_outputs = nn.Linear(self.output_length, 1)
         self.qa_kt_outputs.weight.data.normal_(0, config.initializer_range)
 
         self.gat_wn = multi_relation_net.GAT(num_layers=1,
@@ -452,174 +449,165 @@ class KELM(nn.Module):
         :return:
         """
         # start_forward_time = time()
-        input_ids = kwargs.get("input_ids")
+        label_ids_list = kwargs.get("label_ids")
+        input_ids_list = kwargs.get("input_ids")
         # logger.info("rank:{}".format(input_ids.device))
-        attention_mask = kwargs.get("attention_mask")
-        loss_wn = 0.0
-        loss_cls = 0.0
-        batch_synset_graphs_id = kwargs.get("batch_synset_graphs")
-        wn_synset_graphs = kwargs.get("wn_synset_graphs")
-        batch_synset_graphs = [wn_synset_graphs[i] for i in batch_synset_graphs_id]
-        batch_context_graphs_list = []
-        batch_wn_graphs_list = []
-        batch_entity2token_graphs_list = []
-        batch_entity2token_graphs_nell_list = []
+        attention_mask_list = kwargs.get("attention_mask")
+        token_type_ids_list = kwargs.get("token_type_ids")
+        batch_synset_graphs_id_list = kwargs.get("batch_synset_graphs")
+        wn_synset_graphs_list = kwargs.get("wn_synset_graphs")
+        choice_score_list = []
 
-        token_length_list = []
+        for num in range(2):
+            label_ids = label_ids_list
+            input_ids = input_ids_list[:, num, :]
+            # logger.info("rank:{}".format(input_ids.device))
+            attention_mask = attention_mask_list[:, num, :]
+            if self.config.text_embed_model == "bert":
+                token_type_ids = token_type_ids_list[:, num, :]
+            elif self.config.text_embed_model == "roberta" or self.config.text_embed_model == "roberta_base":
+                token_type_ids = None
+            batch_synset_graphs_id = batch_synset_graphs_id_list
+            wn_synset_graphs = wn_synset_graphs_list[num]
 
-        if self.config.text_embed_model == "bert":
-            text_output = self.text_embed_model(
-                input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=kwargs.get("token_type_ids"),
-                output_attentions=self.config.output_attentions,
-                output_hidden_states=self.config.output_hidden_states
-            )[0]
-        elif self.config.text_embed_model == "roberta" or self.config.text_embed_model == "roberta_base":
-            text_output = self.text_embed_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )[0]
-        relation_list = self.config.relation_list
+            batch_synset_graphs = [wn_synset_graphs[i] for i in batch_synset_graphs_id]
+            batch_context_graphs_list = []
+            batch_wn_graphs_list = []
+            batch_entity2token_graphs_list = []
+            batch_entity2token_graphs_nell_list = []
 
-        inverse_relation_list = []
-        # node_type in origin graph
-        id_type_list = []
-        context_type_list = []
-        for i, relation_type in enumerate(relation_list):
-            inverse_relation_list.append("{}_".format(relation_type))
+            token_length_list = []
 
-            id_type = "wn{}_id".format(relation_type)
-            id_type_list.append(id_type)
+            if self.config.text_embed_model == "bert":
+                text_output = self.text_embed_model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                    output_attentions=self.config.output_attentions,
+                    output_hidden_states=self.config.output_hidden_states
+                )[0]
+            elif self.config.text_embed_model == "roberta" or self.config.text_embed_model == "roberta_base":
+                text_output = self.text_embed_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )[0]
+            relation_list = self.config.relation_list
 
-            context_type = "wn{}_context".format(relation_type)
-            context_type_list.append(context_type)
+            inverse_relation_list = []
+            # node_type in origin graph
+            id_type_list = []
+            context_type_list = []
+            for i, relation_type in enumerate(relation_list):
+                inverse_relation_list.append("{}_".format(relation_type))
 
-        # start_time = time()
-        for i, g in enumerate(batch_synset_graphs):
-            assert (len(g.nodes("token_id")) == torch.sum(attention_mask[i, :]))
-            token_length_list.append(len(g.nodes("token_id")))
+                id_type = "wn{}_id".format(relation_type)
+                id_type_list.append(id_type)
 
-            # reconstruct context graph
-            context_g, wn_g = self.reconstruct_dgl_graph(g, relation_list, inverse_relation_list,
-                                                         id_type_list, context_type_list,
-                                                         text_output[i, :, :], input_ids.device)
+                context_type = "wn{}_context".format(relation_type)
+                context_type_list.append(context_type)
 
-            entity2token_graph, entity2token_graph_nell = self.construct_entity2token_graph(i, g, text_output, input_ids.device)
+            # start_time = time()
+            for i, g in enumerate(batch_synset_graphs):
+                assert (len(g.nodes("token_id")) == torch.sum(attention_mask[i, :]))
+                token_length_list.append(len(g.nodes("token_id")))
 
-            batch_entity2token_graphs_list.append(entity2token_graph)
-            batch_entity2token_graphs_nell_list.append(entity2token_graph_nell)
-            batch_context_graphs_list.append(context_g)
-            batch_wn_graphs_list.append(wn_g)
+                # reconstruct context graph
+                context_g, wn_g = self.reconstruct_dgl_graph(g, relation_list, inverse_relation_list,
+                                                             id_type_list, context_type_list,
+                                                             text_output[i, :, :], input_ids.device)
 
-        batch_context_graphs_dgl = dgl.batch(batch_context_graphs_list)
-        graph_context_embedding = self.rgcn_context(batch_context_graphs_dgl, batch_context_graphs_dgl.ndata['feature'])
-        batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature"] = graph_context_embedding[
-            "wn_concept_context"]
-        # batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature_project"] = self.bert_projected_token_ids(
-        #     graph_context_embedding["wn_concept_context"])
-        batch_context_graphs_list = dgl.unbatch(batch_context_graphs_dgl)
+                entity2token_graph, entity2token_graph_nell = self.construct_entity2token_graph(i, g, text_output, input_ids.device)
 
-        batch_wn_graphs_dgl = dgl.batch(batch_wn_graphs_list)
-        graph_wn_embedding = self.rgcn_wn(batch_wn_graphs_dgl, batch_wn_graphs_dgl.ndata['feature'])
-        batch_wn_graphs_dgl.nodes["wn_concept_id"].data["feature"] = graph_wn_embedding["wn_concept_id"]
-        batch_wn_graphs_list = dgl.unbatch(batch_wn_graphs_dgl)
+                batch_entity2token_graphs_list.append(entity2token_graph)
+                batch_entity2token_graphs_nell_list.append(entity2token_graph_nell)
+                batch_context_graphs_list.append(context_g)
+                batch_wn_graphs_list.append(wn_g)
 
-        memory_output_new = text_output
-        # batch_entity2token_graphs_list_homo_s = []
-        context_embed_new = torch.zeros(
-            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-            dtype=torch.float32, device=input_ids.device)
-        concept_embed_new = torch.zeros(
-            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-            dtype=torch.float32, device=input_ids.device)
+            batch_context_graphs_dgl = dgl.batch(batch_context_graphs_list)
+            graph_context_embedding = self.rgcn_context(batch_context_graphs_dgl, batch_context_graphs_dgl.ndata['feature'])
+            batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature"] = graph_context_embedding[
+                "wn_concept_context"]
+            # batch_context_graphs_dgl.nodes["wn_concept_context"].data["feature_project"] = self.bert_projected_token_ids(
+            #     graph_context_embedding["wn_concept_context"])
+            batch_context_graphs_list = dgl.unbatch(batch_context_graphs_dgl)
 
-        nell_embed_new = torch.zeros(
-            (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
-            dtype=torch.float32, device=input_ids.device)
+            batch_wn_graphs_dgl = dgl.batch(batch_wn_graphs_list)
+            graph_wn_embedding = self.rgcn_wn(batch_wn_graphs_dgl, batch_wn_graphs_dgl.ndata['feature'])
+            batch_wn_graphs_dgl.nodes["wn_concept_id"].data["feature"] = graph_wn_embedding["wn_concept_id"]
+            batch_wn_graphs_list = dgl.unbatch(batch_wn_graphs_dgl)
 
-        # start_time = time()
-        for idx, g_e2t in enumerate(batch_entity2token_graphs_list):
-            g_e2t.nodes["wn_concept_id"].data["context_feature"] = batch_context_graphs_list[idx].nodes["wn_concept_context"].data["feature"]
-            # logger.info("idx {}: {}".format(idx, g_e2t.nodes["wn_concept_id"].data["context_feature"]))
-            g_e2t.nodes["wn_concept_id"].data["id_feature"] = batch_wn_graphs_list[idx].nodes["wn_concept_id"].data["feature"]
-            g_e2t.nodes["token_id"].data["id_feature"] = self.projected_token_text(g_e2t.nodes["token_id"].data["context_feature"])
-            g_e2t.nodes["sentinel_id"].data["id_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["id_feature"], device=input_ids.device)
-            g_e2t.nodes["sentinel_id"].data["context_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["context_feature"], device=input_ids.device)
+            memory_output_new = text_output
+            # batch_entity2token_graphs_list_homo_s = []
+            context_embed_new = torch.zeros(
+                (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+                dtype=torch.float32, device=input_ids.device)
+            concept_embed_new = torch.zeros(
+                (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+                dtype=torch.float32, device=input_ids.device)
 
-            g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['id_feature', 'context_feature'])
-            g_e2t_homo.ndata['context_feature'] = self.gat_context(g_e2t_homo,
-                             g_e2t_homo.ndata['context_feature'])
-            g_e2t_homo.ndata['id_feature'] = self.gat_wn(g_e2t_homo, g_e2t_homo.ndata['id_feature'])
-            tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
+            nell_embed_new = torch.zeros(
+                (memory_output_new.shape[0], memory_output_new.shape[1], self.concept_embed_size),
+                dtype=torch.float32, device=input_ids.device)
 
-            tmp_argsort = torch.argsort(tmp_graph.ndata[dgl.NID]["token_id"] - tmp_graph.num_nodes("sentinel_id"))
-            concept_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
-                "id_feature"].index_select(0, tmp_argsort)
-            context_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
-                "context_feature"].index_select(0, tmp_argsort)
+            # start_time = time()
+            for idx, g_e2t in enumerate(batch_entity2token_graphs_list):
+                g_e2t.nodes["wn_concept_id"].data["context_feature"] = batch_context_graphs_list[idx].nodes["wn_concept_context"].data["feature"]
+                # logger.info("idx {}: {}".format(idx, g_e2t.nodes["wn_concept_id"].data["context_feature"]))
+                g_e2t.nodes["wn_concept_id"].data["id_feature"] = batch_wn_graphs_list[idx].nodes["wn_concept_id"].data["feature"]
+                g_e2t.nodes["token_id"].data["id_feature"] = self.projected_token_text(g_e2t.nodes["token_id"].data["context_feature"])
+                g_e2t.nodes["sentinel_id"].data["id_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["id_feature"], device=input_ids.device)
+                g_e2t.nodes["sentinel_id"].data["context_feature"] = torch.zeros_like(g_e2t.nodes["token_id"].data["context_feature"], device=input_ids.device)
 
-            g_e2t_nell = batch_entity2token_graphs_nell_list[idx]
-            g_e2t_nell_homo = dgl.to_homogeneous(g_e2t_nell, ndata=['id_feature'])
-            g_e2t_nell_homo.ndata['id_feature'] = self.gat_nell(g_e2t_nell_homo, g_e2t_nell_homo.ndata['id_feature'])
-            tmp_graph_nell = dgl.to_heterogeneous(g_e2t_nell_homo, g_e2t_nell.ntypes, g_e2t_nell.etypes)
-            nell_tmp_argsort = torch.argsort(tmp_graph_nell.ndata[dgl.NID]["token_id"] - tmp_graph_nell.num_nodes("sentinel_id") - tmp_graph_nell.num_nodes("nell_concept_id"))
-            nell_embed_new[idx, :tmp_graph_nell.num_nodes("token_id"), :] = tmp_graph_nell.nodes["token_id"].data["id_feature"].index_select(0, nell_tmp_argsort)
-        # # logger.info("time for one by one: {}".format(time() - start_time))
+                g_e2t_homo = dgl.to_homogeneous(g_e2t, ndata=['id_feature', 'context_feature'])
+                g_e2t_homo.ndata['context_feature'] = self.gat_context(g_e2t_homo,
+                                 g_e2t_homo.ndata['context_feature'])
+                g_e2t_homo.ndata['id_feature'] = self.gat_wn(g_e2t_homo, g_e2t_homo.ndata['id_feature'])
+                tmp_graph = dgl.to_heterogeneous(g_e2t_homo, g_e2t.ntypes, g_e2t.etypes)
 
-        if self.use_nell:
-            memory_output_new = torch.cat((memory_output_new, nell_embed_new), 2)
-        if self.use_context_graph and self.use_wn:
-            k_memory = torch.cat((concept_embed_new, context_embed_new), 2)
-        elif self.use_wn:
-            k_memory = concept_embed_new
-        elif self.use_context_graph:
-            k_memory = context_embed_new
-        if self.use_context_graph or self.use_wn:
-            memory_output_new = torch.cat((memory_output_new, k_memory), 2)
+                tmp_argsort = torch.argsort(tmp_graph.ndata[dgl.NID]["token_id"] - tmp_graph.num_nodes("sentinel_id"))
+                concept_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
+                    "id_feature"].index_select(0, tmp_argsort)
+                context_embed_new[idx, :tmp_graph.num_nodes("token_id"), :] = tmp_graph.nodes["token_id"].data[
+                    "context_feature"].index_select(0, tmp_argsort)
+
+                g_e2t_nell = batch_entity2token_graphs_nell_list[idx]
+                g_e2t_nell_homo = dgl.to_homogeneous(g_e2t_nell, ndata=['id_feature'])
+                g_e2t_nell_homo.ndata['id_feature'] = self.gat_nell(g_e2t_nell_homo, g_e2t_nell_homo.ndata['id_feature'])
+                tmp_graph_nell = dgl.to_heterogeneous(g_e2t_nell_homo, g_e2t_nell.ntypes, g_e2t_nell.etypes)
+                nell_tmp_argsort = torch.argsort(tmp_graph_nell.ndata[dgl.NID]["token_id"] - tmp_graph_nell.num_nodes("sentinel_id") - tmp_graph_nell.num_nodes("nell_concept_id"))
+                nell_embed_new[idx, :tmp_graph_nell.num_nodes("token_id"), :] = tmp_graph_nell.nodes["token_id"].data["id_feature"].index_select(0, nell_tmp_argsort)
+            # # logger.info("time for one by one: {}".format(time() - start_time))
+
+            if self.use_nell:
+                memory_output_new = torch.cat((memory_output_new, nell_embed_new), 2)
+            if self.use_context_graph and self.use_wn:
+                k_memory = torch.cat((concept_embed_new, context_embed_new), 2)
+            elif self.use_wn:
+                k_memory = concept_embed_new
+            elif self.use_context_graph:
+                k_memory = context_embed_new
+            if self.use_context_graph or self.use_wn:
+                memory_output_new = torch.cat((memory_output_new, k_memory), 2)
 
 
-        att_output = self.self_matching(memory_output_new,
-                                        attention_mask.unsqueeze(2))  # [batch_size, max_seq_length, memory_output_size]
-        # 4th layer: output layer
-        logits = self.qa_kt_outputs(att_output)
+            att_output = self.self_matching(memory_output_new,
+                                            attention_mask.unsqueeze(2))  # [batch_size, max_seq_length, memory_output_size]
+            # 4th layer: output layer
+            choice_score = self.qa_kt_outputs(att_output[:,0,:])
+            choice_score_list.append(choice_score)
 
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1)
-        end_logits = end_logits.squeeze(-1)
+        logits = torch.cat(
+            [choice_score.unsqueeze(1).squeeze(-1) for choice_score in choice_score_list], dim=1
+        )
 
-        total_loss = None
-        start_positions = kwargs.get("start_positions", None)
-        end_positions = kwargs.get("end_positions", None)
-
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions.clamp_(0, ignored_index)
-            end_positions.clamp_(0, ignored_index)
-
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-            loss_cls = total_loss.detach().clone()
-            if loss_wn:
-                total_loss = total_loss + self.config.consistent_loss_wn_coeff * loss_wn
-            else:
-                loss_wn = torch.tensor(loss_wn, device=loss_cls.device)
-        loss_dic = {
-            'loss_wn': loss_wn,
-            'loss_cls': loss_cls,
-        }
-        output = (start_logits, end_logits)
+        if label_ids[0] != -1:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, 2), label_ids.view(-1))
+        else:
+            loss = None
 
         # logger.info("time for forward: {}".format(time()-start_forward_time))
-        return ((total_loss,) + output + (loss_dic,)) if total_loss is not None else output
+        return loss, logits, label_ids, kwargs.get("qas_ids")
 
     def construct_entity2token_graph(self, i, g, text_output, device):
         data_dict = {
@@ -731,7 +719,7 @@ def configure_tokenizer_model_kelm(args, logger, kgretrievers):
 
     logger.info("***** init config and model *****")
     config = KELMConfig.init_from_args(args, kgretrievers=kgretrievers)
-    logger.info("use both context and kge graph")
+    # logger.info("use both context and kge graph")
     model = KELM(config)
 
     try:

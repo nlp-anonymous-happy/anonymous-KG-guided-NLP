@@ -11,7 +11,7 @@ def configure_tokenizer_model_bert(args, logger, is_preprocess=False):
     logger.info("***** Loading configuration from {} ******".format(args.init_dir))
     config = BertConfig.from_pretrained(
             args.config_name if args.config_name else args.model_name_or_path,
-        cache_dir = args.init_dir)
+        cache_dir=args.init_dir)
     config.vocab_size = len(tokenizer.vocab)
 
     logger.info("***** Loading pretrained model from {} *****".format(args.init_dir))
@@ -25,12 +25,3 @@ def configure_tokenizer_model_bert(args, logger, is_preprocess=False):
                                                          cache_dir=args.init_dir)
 
     return tokenizer, model
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    args = parser.parse_args()
-    logger = logging.getLogger(__name__)
-    args.init_dir = "../../cache/"
-    args.config_name = "bert-large-cased"
-    args.do_lower_case = False
-    configure_tokenizer_model_bert(args,logger)

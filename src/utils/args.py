@@ -21,11 +21,12 @@ import six
 import argparse
 import logging
 
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s', 
-                    datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)
-logging.getLogger().setLevel(logging.INFO)                    
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)
+logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def str2bool(v):
     # because argparse does not support to parse "true, False" as python

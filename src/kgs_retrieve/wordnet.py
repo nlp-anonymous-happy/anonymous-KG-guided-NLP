@@ -126,6 +126,9 @@ class WordnetRetriever(KGRetriever):
                 else:
                     word_to_ori_map[-1].append(i)
         # logger.info("text: {}".format(words))
+        # # remove stop followed by word (uncomment when using copa dataset)
+        # if words[-1][-1] == "." or words[-1][-1] == ",":
+        #     words[-1] = words[-1][:-1]
         for i, word in enumerate(words):
             retrieve_token = run_strip_accents(word.lower()) if tolower else word
             if retrieve_token in set(string.punctuation):
@@ -267,7 +270,7 @@ class WordnetRetriever(KGRetriever):
                         for form in wn._morphy(lemma, p, check_exceptions)]
         return set(morphy_list)
 
-    def is_repeated(self, id):
-        return id in self.repeated_id
+    def is_repeated(self, entity_id):
+        return entity_id in self.repeated_id
 
 

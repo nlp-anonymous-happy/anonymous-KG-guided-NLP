@@ -3,25 +3,25 @@ mkdir log
 fi
 
 DATA_DIR=./data/
-INIT_DIR=./checkpoint/checkpoint/
+INIT_DIR=./cache/bert-large-cased/
 CACHE_DIR=./cache/
 CACHE_STORE_DIR=./cache/
 Model_name_or_path=./cache/bert-large-cased/
 Config_name=./cache/bert-large-cased/
 TOKENIZER_PATH=./cache/bert-large-cased/
 WN18_DIR=./data/kgs/wn18/text/
-TRAIN_FILE=record/train.json
-PRED_FILE=record/dev.json
+TRAIN_FILE=copa/train.tagged.jsonl
+PRED_FILE=copa/val.tagged.jsonl
 
-mark=val_set_2
-mark_r=${mark}_for_checkpoint
+mark=preprocess_copa_2
+mark_r=${mark}_dev
 
 OUTPUT_DIR=./outputs/${mark}
 Tensorboard_dir=./runs
 PWD_DIR=`pwd`
 
-CUDA_VISIBLE_DEVICES=3 python -m torch.distributed.launch --nproc_per_node=1 --master_port=83499 src/run_record_test.py \
-  --cache_file_suffix val_for_checkpoint_2 \
+CUDA_VISIBLE_DEVICES=7 python -m torch.distributed.launch --nproc_per_node=1 --master_port=13498 src/run_copa.py \
+  --cache_file_suffix copa_cache_2 \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
@@ -55,9 +55,6 @@ CUDA_VISIBLE_DEVICES=3 python -m torch.distributed.launch --nproc_per_node=1 --m
   --do_train true \
   --do_eval false \
   --do_lower_case false \
-  --full_table false \
-  --use_context_graph false \
-  --use_wn true \
-  --use_nell true \
-  --test false \
+  --use_wn True \
+  --use_nell False \
   --seed 45 1>$PWD_DIR/log/kelm.${mark_r} 2>&1
