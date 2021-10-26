@@ -10,7 +10,7 @@ def configure_tokenizer_model(args, logger, kgretrievers=None, is_preprocess=Fal
             tokenizer, model = configure_tokenizer_model_roberta(args, logger, is_preprocess)
     else:
         if args.model_type == "kelm":
-            if args.dataset == "record" or "squad":
+            if args.dataset == "record" or args.dataset == "squad":
                 from model.kelm_record import configure_tokenizer_model_kelm
             elif args.dataset == "multirc":
                 from model.kelm_multirc import configure_tokenizer_model_kelm
