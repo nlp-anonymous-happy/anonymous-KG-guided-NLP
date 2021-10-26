@@ -21,7 +21,7 @@ Tensorboard_dir=./runs
 PWD_DIR=`pwd`
 
 CUDA_VISIBLE_DEVICES=7 python -m torch.distributed.launch --nproc_per_node=1 --master_port=83478 src/run_multirc_qa.py \
-  --cache_file_suffix multirc_cahce \
+  --cache_file_suffix multirc_cache \
   --relation_agg sum \
   --per_gpu_train_batch_size 12 \
   --per_gpu_eval_batch_size 12 \
